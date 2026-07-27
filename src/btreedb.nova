@@ -1,0 +1,432 @@
+// btreedb.nova — the TYPED Nova driver for BTreeDB, implementing the `db` seam
+// (db.Connection / db.Driver) over the standardized binary wire protocol.
+//
+// Framing: [type:u8][len:u32 BE][payload], len includes its own 4 bytes (pg convention).
+// The simple-query path ('Q') carries TEXT-format values (btree proto/wire.zig FieldDesc
+// defaults format=text and the executor materializes cells as text); this driver captures
+// each column's type OID from RowDescription and decodes each DataRow cell into a typed
+// db.DbValue accordingly — unlike data/btree/client.nova, which keeps every cell a string.
+//
+//   let drv = BTreeDriver();
+//   let conn = drv.connect("127.0.0.1:3009");
+//   let rs = conn.query("SELECT id, name FROM users", List<DbValue>());
+//   let id = rs.row(0).getInt(0);   // typed, not a string
+//
+// The wire CODEC (frame build + response decode + param substitution) is pure over byte
+// buffers, so it is gated offline (64-bit-verified) without a live server; the connect/
+// query methods wire that codec to a TcpStream and need a running BTreeDB to exercise.
+import net.asyncio;
+import bytes;
+import string;
+import list;
+import db;
+
+// --- Type OIDs (btree proto/wire.zig) -> seam DbType -------------------------
+fn oidToDbType(oid: int): DbType {
+    if (oid == 1) { return DbType.Bool; }
+    if (oid == 2) { return DbType.Int4; }
+    if (oid == 3) { return DbType.Int8; }
+    if (oid == 4) { return DbType.Uint4; }
+    if (oid == 5) { return DbType.Uint8; }
+    if (oid == 6) { return DbType.Float4; }
+    if (oid == 7) { return DbType.Float8; }
+    if (oid == 8) { return DbType.Timestamp; }
+    if (oid == 9) { return DbType.Text; }
+    if (oid == 10) { return DbType.Blob; }
+    if (oid == 11) { return DbType.Decimal; }
+    return DbType.Text;
+}
+
+// --- BtFrame writers — build framed messages as binary-safe Nova strings --------
+fn byte1(b: int): string {
+    let p = bytes.alloc(1);
+    bytes.write_byte(p, 0, b);
+    return p as string;
+}
+fn u16be(v: int): string {
+    let p = bytes.alloc(2);
+    bytes.write_byte(p, 0, (v / 256) % 256);
+    bytes.write_byte(p, 1, v % 256);
+    return p as string;
+}
+fn u32be(v: int): string {
+    let p = bytes.alloc(4);
+    bytes.write_byte(p, 0, (v / 16777216) % 256);
+    bytes.write_byte(p, 1, (v / 65536) % 256);
+    bytes.write_byte(p, 2, (v / 256) % 256);
+    bytes.write_byte(p, 3, v % 256);
+    return p as string;
+}
+fn wstr16(s: string): string { return u16be(s.length) + s; }
+fn frameOf(t: int, payload: string): string { return byte1(t) + u32be(4 + payload.length) + payload; }
+
+/// Build the frames (pub for offline encode gating).
+pub fn buildStartupFrame(user: string, dbname: string): string {
+    let sp = u16be(1) + u16be(0) + wstr16(user) + wstr16(dbname) + wstr16("nova-driver");
+    return frameOf(72, sp);   // 'H'
+}
+pub fn buildQueryFrame(sql: string): string { return frameOf(81, wstr16(sql)); } // 'Q'
+pub fn buildTerminateFrame(): string { return frameOf(88, ""); }                 // 'X'
+
+// --- Client-side parameter substitution --------------------------------------
+// The simple-query path takes SQL text only, so $1..$N are substituted here with the SAME
+// escaping the server uses (btree proto/command.zig): text single-quoted with doubled
+// quotes, numeric/decimal inserted raw, bool -> true/false, NULL -> NULL. Injection-safe
+// because a text value's quotes are doubled and it is never re-parsed as SQL structure.
+// (The extended Parse/Bind path, where the server substitutes, is a follow-on.)
+fn escapeText(s: string): string {
+    let out = "'";
+    let i = 0;
+    let n = s.length;
+    while (i < n) {
+        let ch = s[i];
+        if (ch == 39) { out = out + "''"; }   // ' -> ''
+        else { out = out + string.slice(s, i, i + 1); }
+        i = i + 1;
+    }
+    return out + "'";
+}
+fn valueToSql(v: DbValue): string {
+    if (v.isNull()) { return "NULL"; }
+    if (v.kind == DbType.Bool) { if (v.asBool()) { return "true"; } return "false"; }
+    if (v.kind == DbType.Text || v.kind == DbType.Blob) { return escapeText(v.asText()); }
+    if (v.kind == DbType.Decimal) { return v.asText(); }   // decimal carried as text
+    if (v.kind == DbType.Float4 || v.kind == DbType.Float8) {
+        let d = v.asDouble();
+        return `${d}`;
+    }
+    let iv = v.asLong();
+    return `${iv}`;
+}
+pub fn substituteParams(sql: string, params: List<DbValue>): string {
+    let out = "";
+    let i = 0;
+    let n = sql.length;
+    while (i < n) {
+        let ch = sql[i];
+        if (ch == 36 && i + 1 < n) {   // '$'
+            let d = sql[i + 1];
+            if (d >= 49 && d <= 57) {  // 1..9 (single-digit params)
+                let idx = d - 49;      // $1 -> index 0
+                let p = params.get(idx) ?? db.dbNull();
+                out = out + valueToSql(p);
+                i = i + 2;
+            } else {
+                out = out + "$";
+                i = i + 1;
+            }
+        } else {
+            out = out + string.slice(sql, i, i + 1);
+            i = i + 1;
+        }
+    }
+    return out;
+}
+
+// --- Payload cursor (decode, pure over a byte-buffer string) ------------------
+struct BtCursor {
+    pub s: string,
+    pub pos: int,
+    init(s: string) { self.s = s; self.pos = 0; }
+
+    pub fn byte(self: BtCursor): int {
+        let b = self.s[self.pos];
+        self.pos = self.pos + 1;
+        return b;
+    }
+    pub fn ushort(self: BtCursor): int {
+        let hi = self.byte();
+        let lo = self.byte();
+        return hi * 256 + lo;
+    }
+    pub fn uint(self: BtCursor): int {
+        let a = self.byte();
+        let b = self.byte();
+        let c = self.byte();
+        let d = self.byte();
+        return ((a * 256 + b) * 256 + c) * 256 + d;
+    }
+    pub fn str16(self: BtCursor): string {
+        let n = self.ushort();
+        let out = string.slice(self.s, self.pos, self.pos + n);
+        self.pos = self.pos + n;
+        return out;
+    }
+    pub fn skip(self: BtCursor, n: int): void { self.pos = self.pos + n; }
+}
+
+// --- Response decoders (pure; the offline gate calls these directly) ----------
+
+/// Decode a RowDescription ('T') payload into typed columns.
+/// Layout: field_count(u16) + per field {name(str16), table_id(u32), col_no(u16),
+/// type_oid(u32), type_size(i16), type_mod(i32), format(u16)}.
+pub fn decodeRowDesc(payload: string): List<Column> {
+    let cols = List<Column>();
+    let c = BtCursor(payload);
+    let n = c.ushort();
+    let i = 0;
+    while (i < n) {
+        let name = c.str16();
+        c.skip(4);            // table_id
+        c.skip(2);            // col_no
+        let oid = c.uint();   // type_oid
+        c.skip(2);            // type_size
+        c.skip(4);            // type_mod
+        c.skip(2);            // format (text on the simple-query path)
+        cols.push(Column(name, oidToDbType(oid)));
+        i = i + 1;
+    }
+    return cols;
+}
+
+// Decode one text-format value into a typed cell for the given column type.
+fn decodeCell(t: DbType, raw: string, isNull: bool): DbValue {
+    if (isNull) { return db.dbNull(); }
+    if (t == DbType.Bool) {
+        let tru = string.eql(raw, "true") || string.eql(raw, "t") || string.eql(raw, "1");
+        return db.dbBool(tru);
+    }
+    if (t == DbType.Int4 || t == DbType.Uint4) { return db.dbInt(string.parseI64(raw)); }
+    if (t == DbType.Int8 || t == DbType.Uint8 || t == DbType.Timestamp) { return db.dbLong(string.parseI64(raw)); }
+    if (t == DbType.Float4 || t == DbType.Float8) { return db.dbDouble(string.parseFloat(raw)); }
+    if (t == DbType.Decimal) {
+        // S4: parse the exact text into a decimal128 (.dec, via asDecimal()); keep the raw
+        // text in .s (asText) too.
+        return DbValue(DbType.Decimal, 0, 0.0, decimal.fromString(raw), raw);
+    }
+    return db.dbText(raw);   // Text / Blob
+}
+
+/// Decode a DataRow ('D') payload into a typed Row, using the columns' types.
+/// Layout: field_count(u16) + per field {len(i32, -1=NULL), bytes}.
+pub fn decodeDataRow(payload: string, cols: List<Column>): Row {
+    let row = Row();
+    let c = BtCursor(payload);
+    let n = c.ushort();
+    let i = 0;
+    while (i < n) {
+        let len = c.uint();
+        let col = cols.get(i) ?? Column("", DbType.Text);
+        // NULL is the wire's -1 length. The 4 BE bytes 0xFFFFFFFF read back as the signed
+        // i32 -1 (when int arithmetic is 32-bit) or as 4294967295 (when 64-bit) — accept both,
+        // so the NULL sentinel is detected regardless of int width.
+        if (len == 4294967295 || len == -1) {
+            row.cells.push(decodeCell(col.type_oid, "", true));
+        } else {
+            let raw = string.slice(c.s, c.pos, c.pos + len);
+            c.skip(len);
+            row.cells.push(decodeCell(col.type_oid, raw, false));
+        }
+        i = i + 1;
+    }
+    return row;
+}
+
+/// Decode a CommandComplete ('C') payload -> tag string (e.g. "SELECT 2" / "OK 1").
+pub fn decodeTag(payload: string): string {
+    let c = BtCursor(payload);
+    return c.str16();
+}
+
+/// Decode an ErrorResponse ('E') payload {severity(str16), code(str16), message(str16)}.
+pub fn decodeError(payload: string): DbError {
+    let c = BtCursor(payload);
+    let sev = c.str16();
+    let code = c.str16();
+    let msg = c.str16();
+    return DbError(code, msg);
+}
+
+// "OK 5" / "SELECT 3" -> the trailing count as a long (0 if absent).
+fn tagCount(tag: string): int {
+    let sp = string.lastIndexOf(tag, " ");
+    if (sp == -1) { return 0; }
+    let num = string.slice(tag, sp + 1, tag.length);
+    return string.parseI64(num);
+}
+
+// --- Buffered frame reader over a live TCP stream ----------------------------
+struct BtReader {
+    pub io: asyncio.AsyncStream,   // A1 async-first: `fill` awaits io.recvInto (parks, no thread held)
+    pub buf: ptr,
+    pub cap: int,
+    pub len: int,
+    pub pos: int,
+    init(io: asyncio.AsyncStream) {
+        self.io = io;
+        self.cap = 65536;
+        self.buf = bytes.alloc(65536);
+        self.len = 0;
+        self.pos = 0;
+    }
+
+    // `buf` is a raw byte buffer (a `ptr`, not an ARC-managed field), so ARC will not free it — it needs
+    // a cleanup hook, called only by the destructor. Without this the 64KB read buffer leaked per
+    // connection (the BtReader end-to-end leak).
+    fn delete(self: BtReader): void {
+        if (self.buf != 0) {
+            bytes.free(self.buf);
+            self.buf = 0;
+        }
+    }
+}
+async fn fill(r: BtReader): bool {
+    if (r.pos > 0) {
+        let i = 0;
+        while (r.pos + i < r.len) {
+            bytes.write_byte(r.buf, i, bytes.read_byte(r.buf, r.pos + i));
+            i = i + 1;
+        }
+        r.len = r.len - r.pos;
+        r.pos = 0;
+    }
+    let space = r.cap - r.len;
+    let n = await r.io.recvInto((r.buf + r.len) as int, space);   // parks the coroutine
+    if (n <= 0) { return false; }
+    r.len = r.len + n;
+    return true;
+}
+async fn need(r: BtReader, k: int): bool {
+    while (r.len - r.pos < k) { if (!(await fill(r))) { return false; } }
+    return true;
+}
+fn rbyte(r: BtReader): int { let b = bytes.read_byte(r.buf, r.pos); r.pos = r.pos + 1; return b; }
+fn ru32(r: BtReader): int {
+    let a = rbyte(r); let b = rbyte(r); let c = rbyte(r); let d = rbyte(r);
+    return ((a * 256 + b) * 256 + c) * 256 + d;
+}
+
+struct BtFrame {
+    pub ftype: int,
+    pub payload: string,
+    init(ftype: int, payload: string) { self.ftype = ftype; self.payload = payload; }
+}
+async fn readFrame(r: BtReader): BtFrame {
+    if (!(await need(r, 5))) { return BtFrame(-1, ""); }
+    let t = rbyte(r);
+    let len = ru32(r);
+    let plen = len - 4;
+    // Defensive: a corrupt/partial length (server crashed mid-stream, or a protocol
+    // desync under concurrent load) must NOT reach bytes.alloc — a negative plen or a
+    // multi-GB plen segfaults the client. Treat anything out of range as a broken
+    // connection and return the error frame the callers already handle.
+    if (plen < 0 || plen > 67108864) { return BtFrame(-1, ""); }
+    if (plen > 0) {
+        if (!(await need(r, plen))) { return BtFrame(-1, ""); }
+    }
+    let out = bytes.alloc(plen);
+    let i = 0;
+    while (i < plen) {
+        bytes.write_byte(out, i, bytes.read_byte(r.buf, r.pos + i));
+        i = i + 1;
+    }
+    r.pos = r.pos + plen;
+    // Bind the `as string` cast to a local so it is registered as an owned temporary — an inline
+    // `out as string` cast-of-a-buffer as a constructor arg is NOT tracked as owned (the ARC-edge in the
+    // deferred backlog), so the frame payload leaked. Binding first is the clean pattern.
+    let payload = out as string;
+    return BtFrame(t, payload);
+}
+
+async fn sendFrame(io: asyncio.AsyncStream, frame: string): int {
+    // Binary-safe: send exactly frame.length bytes (embedded NULs and all). Parks on the write.
+    return await io.sendStr(frame);
+}
+
+// --- The seam implementation --------------------------------------------------
+
+/// A live BTreeDB connection implementing the db.Connection seam.
+pub struct BTreeConnection impl Connection {
+    pub io: asyncio.AsyncStream,
+    pub reader: BtReader,
+    pub prepared: List<string>,   // D6: emulated prepared-statement cache (client-side substitution)
+    init(io: asyncio.AsyncStream, reader: BtReader) {
+        self.io = io;
+        self.reader = reader;
+        self.prepared = List<string>();
+    }
+
+    pub async fn query(self, sql: string, params: List<DbValue>): ResultSet {
+        let finalSql = substituteParams(sql, params);
+        let sn = await sendFrame(self.io, buildQueryFrame(finalSql));
+        let rs = ResultSet();
+        while (true) {
+            let f = await readFrame(self.reader);
+            if (f.ftype == -1) { break; }
+            if (f.ftype == 90) { break; }                                   // 'Z' ReadyForQuery
+            if (f.ftype == 84) { rs.columns = decodeRowDesc(f.payload); }   // 'T'
+            if (f.ftype == 68) { rs.rows.push(decodeDataRow(f.payload, rs.columns)); } // 'D'
+            if (f.ftype == 67) {                                            // 'C'
+                rs.tag = decodeTag(f.payload);
+                rs.rows_affected = tagCount(rs.tag);
+            }
+        }
+        return rs;
+    }
+
+    pub async fn exec(self, sql: string, params: List<DbValue>): ExecResult {
+        let finalSql = substituteParams(sql, params);
+        let sn = await sendFrame(self.io, buildQueryFrame(finalSql));
+        let tag = "";
+        while (true) {
+            let f = await readFrame(self.reader);
+            if (f.ftype == -1) { break; }
+            if (f.ftype == 90) { break; }
+            if (f.ftype == 67) { tag = decodeTag(f.payload); }   // 'C'
+        }
+        return ExecResult(tagCount(tag), tag);
+    }
+
+    pub fn close(self): void {
+        // Sync trait method — just close the socket. A graceful Terminate would need an async send,
+        // which cannot be driven here (close is often called from inside a coroutine, where a nested
+        // drive would deadlock nova_run_root). An abrupt close is fine.
+        self.io.close();
+    }
+
+    pub fn setTimeout(self, ms: int): int {   // D6 — async per-recv awaited deadline
+        return self.io.setTimeout(ms);
+    }
+
+    // D6 prepared statements — emulated (client-side $N substitution via query/exec).
+    pub async fn prepare(self, sql: string): int {
+        let i = 0;
+        while (i < self.prepared.size()) {
+            if (string.eql(self.prepared.get(i) ?? "", sql)) { return i; }
+            i = i + 1;
+        }
+        self.prepared.push(sql);
+        return self.prepared.size() - 1;
+    }
+    pub async fn queryPrepared(self, stmt: int, params: List<DbValue>): ResultSet {
+        if (stmt < 0 || stmt >= self.prepared.size()) { return ResultSet(); }
+        return await self.query(self.prepared.get(stmt) ?? "", params);
+    }
+    pub async fn execPrepared(self, stmt: int, params: List<DbValue>): ExecResult {
+        if (stmt < 0 || stmt >= self.prepared.size()) { return ExecResult(0, ""); }
+        return await self.exec(self.prepared.get(stmt) ?? "", params);
+    }
+}
+
+/// The BTreeDB driver — `connect(dsn)` opens a connection. DSN is `host:port`.
+// Whole connect + startup handshake as ONE async fn, driven once by the sync Driver.connect.
+async fn btConnectAsync(dsn: string): BTreeConnection {
+    let colon = string.lastIndexOf(dsn, ":");
+    let host = colon == -1 ? dsn : string.slice(dsn, 0, colon);
+    let port = colon == -1 ? 3009 : string.parseI64(string.slice(dsn, colon + 1, dsn.length));
+    let stream = await asyncio.asyncConnect(host, port);
+    let reader = BtReader(stream);
+    let sn = await sendFrame(stream, buildStartupFrame("admin", "nova"));
+    while (true) {
+        let f = await readFrame(reader);
+        if (f.ftype == -1) { break; }
+        if (f.ftype == 90) { break; }   // 'Z' ReadyForQuery
+    }
+    return BTreeConnection(stream, reader);
+}
+
+pub struct BTreeDriver impl Driver {
+    pub async fn connect(self, dsn: string): Connection {
+        return await btConnectAsync(dsn);   // sync trait method drives the async connect once
+    }
+}
