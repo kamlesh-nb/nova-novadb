@@ -100,6 +100,13 @@ fn test_tag_and_error_decode(): void {
     assert.equalStr(err.code, "42P01");
     assert.equalStr(err.message, "no such table");
     assert.isTrue(!err.isEmpty());
+
+    // T1: query/exec now put a decoded 'E' frame on the result instead of dropping it.
+    let rs = db.errorResult(err);
+    assert.isTrue(rs.hasError());
+    assert.equalStr(rs.err.code, "42P01");
+    assert.isTrue(db.errorExec(err).hasError());
+    assert.isTrue(!db.ResultSet().hasError());
 }
 
 @test
