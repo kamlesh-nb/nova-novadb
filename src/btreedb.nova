@@ -16,6 +16,8 @@
 // buffers, so it is gated offline (64-bit-verified) without a live server; the connect/
 // query methods wire that codec to a TcpStream and need a running BTreeDB to exercise.
 import net.aio;
+import net.asynctls;
+import io.file;
 import bytes;
 import string;
 import list;
@@ -247,12 +249,12 @@ fn tagCount(tag: string): int {
 
 // --- Buffered frame reader over a live TCP stream ----------------------------
 struct BtReader {
-    pub io: aio.AsyncStream,   // A1 async-first: `fill` awaits io.recvInto (parks, no thread held)
+    pub io: aio.AsyncIO,   // A1 async-first: `fill` awaits io.recvInto (parks, no thread held)
     pub buf: ptr,
     pub cap: int,
     pub len: int,
     pub pos: int,
-    init(io: aio.AsyncStream) {
+    init(io: aio.AsyncIO) {
         self.io = io;
         self.cap = 65536;
         self.buf = bytes.alloc(65536);
@@ -328,7 +330,7 @@ async fn readFrame(r: BtReader): BtFrame {
     return BtFrame(t, payload);
 }
 
-async fn sendFrame(io: aio.AsyncStream, frame: string): int {
+async fn sendFrame(io: aio.AsyncIO, frame: string): int {
     // Binary-safe: send exactly frame.length bytes (embedded NULs and all). Parks on the write.
     return await io.sendStr(frame);
 }
@@ -337,10 +339,10 @@ async fn sendFrame(io: aio.AsyncStream, frame: string): int {
 
 /// A live BTreeDB connection implementing the db.Connection seam.
 pub struct BTreeConnection impl Connection {
-    pub io: aio.AsyncStream,
+    pub io: aio.AsyncIO,
     pub reader: BtReader,
     pub prepared: List<string>,   // D6: emulated prepared-statement cache (client-side substitution)
-    init(io: aio.AsyncStream, reader: BtReader) {
+    init(io: aio.AsyncIO, reader: BtReader) {
         self.io = io;
         self.reader = reader;
         self.prepared = List<string>();
@@ -414,19 +416,56 @@ pub struct BTreeConnection impl Connection {
 
 /// The BTreeDB driver — `connect(dsn)` opens a connection. DSN is `host:port`.
 // Whole connect + startup handshake as ONE async fn, driven once by the sync Driver.connect.
+// Pull `key=value` out of a `?a=b&c=d` DSN query string (returns `dflt` if absent).
+fn dsnParam(dsn: string, key: string, dflt: string): string {
+    let needle = key + "=";
+    let idx = string.indexOf(dsn, needle);
+    if (idx == -1) { return dflt; }
+    let rest = string.slice(dsn, idx + needle.length, dsn.length);
+    let amp = string.indexOf(rest, "&");
+    if (amp == -1) { return rest; }
+    return string.slice(rest, 0, amp);
+}
+
 async fn btConnectAsync(dsn: string): BTreeConnection {
-    let colon = string.lastIndexOf(dsn, ":");
-    let host = colon == -1 ? dsn : string.slice(dsn, 0, colon);
-    let port = colon == -1 ? 3009 : string.parseI64(string.slice(dsn, colon + 1, dsn.length));
+    let tlsOpt = dsnParam(dsn, "tls", "false");
+    let useTls = string.eql(tlsOpt, "true") || string.eql(tlsOpt, "verify");
+    let verify = string.eql(tlsOpt, "verify");
+    let caFile = dsnParam(dsn, "tlsCAFile", "");
+
+    let base = dsn;
+    let qq = string.indexOf(base, "?");
+    if (qq != -1) { base = string.slice(base, 0, qq); }
+    let colon = string.lastIndexOf(base, ":");
+    let host = colon == -1 ? base : string.slice(base, 0, colon);
+    let port = colon == -1 ? 3009 : string.parseI64(string.slice(base, colon + 1, base.length));
+
+    // BTreeDB uses implicit TLS (the server serves TLS on the port when configured); tlsConnect[Verify]
+    // is the whole client story. Both return an AsyncIO the connection holds transparently.
+    if (useTls) {
+        if (verify) {
+            let caPem = if (caFile != "") File.readText(caFile) else "";
+            let ts = await asynctls.tlsConnectVerify(host, port, caPem);
+            return await btStartup(ts);
+        }
+        let ts2 = await asynctls.tlsConnect(host, port, false);
+        return await btStartup(ts2);
+    }
     let stream = await aio.asyncConnect(host, port);
-    let reader = BtReader(stream);
-    let sn = await sendFrame(stream, buildStartupFrame("admin", "nova"));
+    return await btStartup(stream);
+}
+
+// Run startup over `io` (plaintext AsyncStream or TlsStream, both AsyncIO). Passing the concrete stream
+// into this AsyncIO param is a widening (the safe direction).
+async fn btStartup(io: aio.AsyncIO): BTreeConnection {
+    let reader = BtReader(io);
+    let sn = await sendFrame(io, buildStartupFrame("admin", "nova"));
     while (true) {
         let f = await readFrame(reader);
         if (f.ftype == -1) { break; }
         if (f.ftype == 90) { break; }   // 'Z' ReadyForQuery
     }
-    return BTreeConnection(stream, reader);
+    return BTreeConnection(io, reader);
 }
 
 pub struct BTreeDriver impl Driver {
