@@ -15,7 +15,7 @@
 // The wire CODEC (frame build + response decode + param substitution) is pure over byte
 // buffers, so it is gated offline (64-bit-verified) without a live server; the connect/
 // query methods wire that codec to a TcpStream and need a running BTreeDB to exercise.
-import net.asyncio;
+import net.aio;
 import bytes;
 import string;
 import list;
@@ -247,12 +247,12 @@ fn tagCount(tag: string): int {
 
 // --- Buffered frame reader over a live TCP stream ----------------------------
 struct BtReader {
-    pub io: asyncio.AsyncStream,   // A1 async-first: `fill` awaits io.recvInto (parks, no thread held)
+    pub io: aio.AsyncStream,   // A1 async-first: `fill` awaits io.recvInto (parks, no thread held)
     pub buf: ptr,
     pub cap: int,
     pub len: int,
     pub pos: int,
-    init(io: asyncio.AsyncStream) {
+    init(io: aio.AsyncStream) {
         self.io = io;
         self.cap = 65536;
         self.buf = bytes.alloc(65536);
@@ -328,7 +328,7 @@ async fn readFrame(r: BtReader): BtFrame {
     return BtFrame(t, payload);
 }
 
-async fn sendFrame(io: asyncio.AsyncStream, frame: string): int {
+async fn sendFrame(io: aio.AsyncStream, frame: string): int {
     // Binary-safe: send exactly frame.length bytes (embedded NULs and all). Parks on the write.
     return await io.sendStr(frame);
 }
@@ -337,10 +337,10 @@ async fn sendFrame(io: asyncio.AsyncStream, frame: string): int {
 
 /// A live BTreeDB connection implementing the db.Connection seam.
 pub struct BTreeConnection impl Connection {
-    pub io: asyncio.AsyncStream,
+    pub io: aio.AsyncStream,
     pub reader: BtReader,
     pub prepared: List<string>,   // D6: emulated prepared-statement cache (client-side substitution)
-    init(io: asyncio.AsyncStream, reader: BtReader) {
+    init(io: aio.AsyncStream, reader: BtReader) {
         self.io = io;
         self.reader = reader;
         self.prepared = List<string>();
@@ -414,7 +414,7 @@ async fn btConnectAsync(dsn: string): BTreeConnection {
     let colon = string.lastIndexOf(dsn, ":");
     let host = colon == -1 ? dsn : string.slice(dsn, 0, colon);
     let port = colon == -1 ? 3009 : string.parseI64(string.slice(dsn, colon + 1, dsn.length));
-    let stream = await asyncio.asyncConnect(host, port);
+    let stream = await aio.asyncConnect(host, port);
     let reader = BtReader(stream);
     let sn = await sendFrame(stream, buildStartupFrame("admin", "nova"));
     while (true) {
