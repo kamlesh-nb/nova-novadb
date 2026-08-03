@@ -355,13 +355,23 @@ pub struct BTreeConnection impl Connection {
     pub io: aio.AsyncIO,
     pub reader: BtReader,
     pub prepared: List<string>,   // D6: emulated prepared-statement cache (client-side substitution)
+    pub busy: bool,               // concurrency guard: one in-flight request per connection
     init(io: aio.AsyncIO, reader: BtReader) {
         self.io = io;
         self.reader = reader;
         self.prepared = List<string>();
+        self.busy = false;
     }
 
+    // T9 concurrency guard: query/exec are the frame-sending methods and each hold `busy` for the
+    // duration of a request/response. A connection is a single request/response channel; a second
+    // concurrent request would interleave frames and corrupt the stream. Refuse re-entry instead
+    // (use a pool for concurrency). queryPrepared/execPrepared and begin/commit/rollback delegate
+    // to these two, so they are protected transitively — they must NOT take their own guard, or the
+    // inner delegated call would falsely see `busy` and reject.
     pub async fn query(self, sql: string, params: List<DbValue>): ResultSet {
+        if (self.busy) { return db.errorResult(db.DbError("", "connection busy: concurrent use")); }
+        self.busy = true;
         let finalSql = substituteParams(sql, params);
         let sn = await sendFrame(self.io, buildQueryFrame(finalSql));
         let rs = ResultSet();
@@ -377,10 +387,13 @@ pub struct BTreeConnection impl Connection {
             }
             if (f.ftype == 69) { rs.err = decodeError(f.payload); }         // 'E' ErrorResponse
         }
+        self.busy = false;
         return rs;
     }
 
     pub async fn exec(self, sql: string, params: List<DbValue>): ExecResult {
+        if (self.busy) { return errorExec(db.DbError("", "connection busy: concurrent use")); }
+        self.busy = true;
         let finalSql = substituteParams(sql, params);
         let sn = await sendFrame(self.io, buildQueryFrame(finalSql));
         let tag = "";
@@ -392,6 +405,7 @@ pub struct BTreeConnection impl Connection {
             if (f.ftype == 67) { tag = decodeTag(f.payload); }   // 'C'
             if (f.ftype == 69) { err = decodeError(f.payload); }  // 'E' ErrorResponse
         }
+        self.busy = false;
         if (!err.isEmpty()) { return errorExec(err); }
         return ExecResult(tagCount(tag), tag);
     }
