@@ -70,12 +70,115 @@ pub fn buildStartupFrame(user: string, dbname: string): string {
 pub fn buildQueryFrame(sql: string): string { return frameOf(81, wstr16(sql)); } // 'Q'
 pub fn buildTerminateFrame(): string { return frameOf(88, ""); }                 // 'X'
 
+// A cleartext-password response ('p') — sent only if the server issues an AuthenticationCleartextPassword
+// request (method 3). The current btree server accepts startup unconditionally (session.zig sends AuthOk
+// method 0 without challenging), so this frame is dormant against today's server but keeps the driver
+// correct if the server later enforces password auth.
+pub fn buildPasswordFrame(password: string): string { return frameOf(112, wstr16(password)); } // 'p'
+
+// --- Extended query protocol: Parse / Bind / Execute / Sync (T14) ------------
+// The btree server implements the extended path SERVER-SIDE (btree proto/session.zig):
+//   'P' Parse   -> stores a named prepared statement + a ParamClass per declared param OID
+//   'B' Bind    -> looks up the statement, substitutes the bound param VALUES into the SQL
+//                  server-side (proto/command.zig, class-driven escaping), creates a portal
+//   'E' Execute -> runs the portal, streams RowDescription/DataRow*/CommandComplete
+//   'S' Sync    -> flushes and replies ReadyForQuery ('Z')
+// So Bind is REAL server-side substitution (the client sends raw typed values; the server quotes/
+// validates), not the client-side text splice the simple-query path uses. The Parse declares each
+// param's type OID; the server maps OID -> class (text/blob=quoted, bool=normalized, else=numeric-
+// validated). Bind param VALUES are sent in TEXT format ([i32 len][bytes], len -1 = NULL); the server
+// ignores the format codes and re-quotes by class, so we send raw unescaped text here (NOT the escaped
+// literal the simple path builds).
+
+// Map a bound value's kind to the wire type OID the server classifies for escaping.
+// Timestamp is carried as ISO text, so it is declared as text(9) => quoted (a numeric class would
+// reject the ISO string as a non-numeric literal server-side).
+fn paramOid(v: DbValue): int {
+    if (v.isNull()) { return 9; }                 // text class (safe quoting)
+    let k = v.kind;
+    if (k == DbType.Bool) { return 1; }
+    if (k == DbType.Int4) { return 2; }
+    if (k == DbType.Int8) { return 3; }
+    if (k == DbType.Uint4) { return 4; }
+    if (k == DbType.Uint8) { return 5; }
+    if (k == DbType.Float4) { return 6; }
+    if (k == DbType.Float8) { return 7; }
+    if (k == DbType.Text) { return 9; }
+    if (k == DbType.Blob) { return 10; }
+    if (k == DbType.Decimal) { return 11; }
+    return 9;                                       // Timestamp + fallback -> text class
+}
+
+// The RAW text-format value for a bound param (the server applies class escaping, so no quoting here).
+fn paramValueText(v: DbValue): string {
+    if (v.kind == DbType.Bool) { if (v.asBool()) { return "true"; } return "false"; }
+    if (v.kind == DbType.Text || v.kind == DbType.Blob) { return v.asText(); }
+    if (v.kind == DbType.Timestamp || v.kind == DbType.Decimal) { return v.asText(); }
+    if (v.kind == DbType.Float4 || v.kind == DbType.Float8) {
+        let d = v.asDouble();
+        return `${d}`;
+    }
+    let iv = v.asLong();
+    return `${iv}`;
+}
+
+// Encode one Bind param VALUE: [i32 len][bytes], or i32 -1 for NULL.
+fn bindValue(v: DbValue): string {
+    if (v.isNull()) {
+        let p = bytes.alloc(4);
+        bytes.write_byte(p, 0, 255);
+        bytes.write_byte(p, 1, 255);
+        bytes.write_byte(p, 2, 255);
+        bytes.write_byte(p, 3, 255);   // i32 -1 (0xFFFFFFFF) = SQL NULL
+        return p as string;
+    }
+    let t = paramValueText(v);
+    return u32be(t.length) + t;
+}
+
+/// Parse ('P'): [stmt_name][sql][u16 param_count][u32 oid]*  — declares a named statement.
+pub fn buildParseFrame(name: string, sql: string, params: List<DbValue>): string {
+    let p = wstr16(name) + wstr16(sql) + u16be(params.size());
+    let i = 0;
+    while (i < params.size()) {
+        p = p + u32be(paramOid(params.get(i) ?? db.dbNull()));
+        i = i + 1;
+    }
+    return frameOf(80, p);   // 'P'
+}
+
+/// Bind ('B'): [portal][stmt][u16 fmt_count=0][u16 param_count][value]*[u16 result_fmt_count=0].
+/// 0 param formats => all text (server re-quotes by class); 0 result formats => text results.
+pub fn buildBindFrame(portal: string, stmt: string, params: List<DbValue>): string {
+    let p = wstr16(portal) + wstr16(stmt) + u16be(0) + u16be(params.size());
+    let i = 0;
+    while (i < params.size()) {
+        p = p + bindValue(params.get(i) ?? db.dbNull());
+        i = i + 1;
+    }
+    p = p + u16be(0);        // 0 result formats
+    return frameOf(66, p);   // 'B'
+}
+
+/// Execute ('E'): [portal][u32 max_rows]. max_rows 0 = all rows in one stream.
+pub fn buildExecuteFrame(portal: string, maxRows: int): string {
+    return frameOf(69, wstr16(portal) + u32be(maxRows));   // 'E'
+}
+
+/// Sync ('S'): empty payload; the server replies ReadyForQuery ('Z').
+pub fn buildSyncFrame(): string { return frameOf(83, ""); }   // 'S'
+
+// A per-handle statement/portal name. The server replaces a same-named prepared statement on re-Parse,
+// so reusing the name across calls of the same handle is safe (and cheap).
+fn stmtName(handle: int): string { return `s${handle}`; }
+
 // --- Client-side parameter substitution --------------------------------------
 // The simple-query path takes SQL text only, so $1..$N are substituted here with the SAME
 // escaping the server uses (btree proto/command.zig): text single-quoted with doubled
 // quotes, numeric/decimal inserted raw, bool -> true/false, NULL -> NULL. Injection-safe
 // because a text value's quotes are doubled and it is never re-parsed as SQL structure.
-// (The extended Parse/Bind path, where the server substitutes, is a follow-on.)
+// This is used by the SIMPLE-query ('Q') path (query/exec). The prepared methods now use the
+// EXTENDED Parse/Bind/Execute path where the SERVER substitutes — see buildParseFrame above.
 fn escapeText(s: string): string {
     let out = "'";
     let i = 0;
@@ -243,6 +346,12 @@ pub fn decodeTag(payload: string): string {
     return c.str16();
 }
 
+/// Decode an Authentication ('R') payload -> the u32 method (0=Ok, 3=CleartextPassword, 10=SASL).
+pub fn authMethod(payload: string): int {
+    let c = BtCursor(payload);
+    return c.uint();
+}
+
 /// Decode an ErrorResponse ('E') payload {severity(str16), code(str16), message(str16)}.
 pub fn decodeError(payload: string): DbError {
     let c = BtCursor(payload);
@@ -363,12 +472,13 @@ pub struct BTreeConnection impl Connection {
         self.busy = false;
     }
 
-    // T9 concurrency guard: query/exec are the frame-sending methods and each hold `busy` for the
-    // duration of a request/response. A connection is a single request/response channel; a second
-    // concurrent request would interleave frames and corrupt the stream. Refuse re-entry instead
-    // (use a pool for concurrency). queryPrepared/execPrepared and begin/commit/rollback delegate
-    // to these two, so they are protected transitively — they must NOT take their own guard, or the
-    // inner delegated call would falsely see `busy` and reject.
+    // T9 concurrency guard: query/exec/queryPrepared/execPrepared are the frame-sending methods and each
+    // hold `busy` for the duration of a request/response. A connection is a single request/response
+    // channel; a second concurrent request would interleave frames and corrupt the stream. Refuse re-entry
+    // instead (use a pool for concurrency). begin/commit/rollback delegate to exec, so they are protected
+    // transitively and must NOT take their own guard, or the inner delegated call would falsely see `busy`
+    // and reject. queryPrepared/execPrepared send their OWN extended-query frames (they do not delegate to
+    // query/exec) so they take the guard directly.
     pub async fn query(self, sql: string, params: List<DbValue>): ResultSet {
         if (self.busy) { return db.errorResult(db.DbError("", "connection busy: concurrent use")); }
         self.busy = true;
@@ -421,7 +531,13 @@ pub struct BTreeConnection impl Connection {
         return self.io.setTimeout(ms);
     }
 
-    // D6 prepared statements — emulated (client-side $N substitution via query/exec).
+    // T14 prepared statements — REAL server-side Parse/Bind/Execute (extended query protocol).
+    // prepare() caches the SQL text and returns a handle. queryPrepared/execPrepared then send
+    // Parse+Bind+Execute+Sync so the SERVER substitutes the bound params (proto/command.zig), not the
+    // client. The Parse is (re)issued per call because each param's declared type OID is derived from the
+    // bound value's kind — the server maps OID -> escaping class, so the concrete param types must travel
+    // with the Bind. The server replaces a same-named statement on re-Parse, so the per-handle name is
+    // stable and cheap to re-declare.
     pub async fn prepare(self, sql: string): int {
         let i = 0;
         while (i < self.prepared.size()) {
@@ -433,11 +549,51 @@ pub struct BTreeConnection impl Connection {
     }
     pub async fn queryPrepared(self, stmt: int, params: List<DbValue>): ResultSet {
         if (stmt < 0 || stmt >= self.prepared.size()) { return ResultSet(); }
-        return await self.query(self.prepared.get(stmt) ?? "", params);
+        if (self.busy) { return db.errorResult(db.DbError("", "connection busy: concurrent use")); }
+        self.busy = true;
+        let sql = self.prepared.get(stmt) ?? "";
+        let name = stmtName(stmt);
+        let batch = buildParseFrame(name, sql, params) + buildBindFrame(name, name, params)
+            + buildExecuteFrame(name, 0) + buildSyncFrame();
+        let sn = await sendFrame(self.io, batch);
+        let rs = ResultSet();
+        while (true) {
+            let f = await readFrame(self.reader);
+            if (f.ftype == -1) { break; }
+            if (f.ftype == 90) { break; }                                   // 'Z' ReadyForQuery (from Sync)
+            if (f.ftype == 84) { rs.columns = decodeRowDesc(f.payload); }   // 'T' RowDescription
+            if (f.ftype == 68) { rs.rows.push(decodeDataRow(f.payload, rs.columns)); } // 'D' DataRow
+            if (f.ftype == 67) {                                            // 'C' CommandComplete
+                rs.tag = decodeTag(f.payload);
+                rs.rows_affected = tagCount(rs.tag);
+            }
+            if (f.ftype == 69) { rs.err = decodeError(f.payload); }         // 'E' ErrorResponse
+            // '1' parse_complete (49), '2' bind_complete (50), 's' portal_suspended (115) are acks — ignore.
+        }
+        self.busy = false;
+        return rs;
     }
     pub async fn execPrepared(self, stmt: int, params: List<DbValue>): ExecResult {
         if (stmt < 0 || stmt >= self.prepared.size()) { return ExecResult(0, ""); }
-        return await self.exec(self.prepared.get(stmt) ?? "", params);
+        if (self.busy) { return errorExec(db.DbError("", "connection busy: concurrent use")); }
+        self.busy = true;
+        let sql = self.prepared.get(stmt) ?? "";
+        let name = stmtName(stmt);
+        let batch = buildParseFrame(name, sql, params) + buildBindFrame(name, name, params)
+            + buildExecuteFrame(name, 0) + buildSyncFrame();
+        let sn = await sendFrame(self.io, batch);
+        let tag = "";
+        let err = noError();
+        while (true) {
+            let f = await readFrame(self.reader);
+            if (f.ftype == -1) { break; }
+            if (f.ftype == 90) { break; }                          // 'Z' ReadyForQuery (from Sync)
+            if (f.ftype == 67) { tag = decodeTag(f.payload); }     // 'C' CommandComplete
+            if (f.ftype == 69) { err = decodeError(f.payload); }   // 'E' ErrorResponse
+        }
+        self.busy = false;
+        if (!err.isEmpty()) { return errorExec(err); }
+        return ExecResult(tagCount(tag), tag);
     }
 
     // Transaction control (standard SQL).
@@ -468,6 +624,26 @@ async fn btConnectAsync(dsn: string): BTreeConnection {
     let base = dsn;
     let qq = string.indexOf(base, "?");
     if (qq != -1) { base = string.slice(base, 0, qq); }
+
+    // Credentials from the DSN. `user=`/`password=`/`db=` query params provide defaults; a
+    // `user:pass@host:port` userinfo prefix (if present) overrides user/password. Real creds now
+    // flow into the startup + auth handshake instead of the previously hardcoded "admin"/"nova".
+    let user = dsnParam(dsn, "user", "admin");
+    let password = dsnParam(dsn, "password", "");
+    let dbname = dsnParam(dsn, "db", "nova");
+    let at = string.indexOf(base, "@");
+    if (at != -1) {
+        let userinfo = string.slice(base, 0, at);
+        base = string.slice(base, at + 1, base.length);
+        let uc = string.indexOf(userinfo, ":");
+        if (uc == -1) {
+            user = userinfo;
+        } else {
+            user = string.slice(userinfo, 0, uc);
+            password = string.slice(userinfo, uc + 1, userinfo.length);
+        }
+    }
+
     let colon = string.lastIndexOf(base, ":");
     let host = colon == -1 ? base : string.slice(base, 0, colon);
     let port = colon == -1 ? 3009 : string.parseI64(string.slice(base, colon + 1, base.length));
@@ -478,24 +654,34 @@ async fn btConnectAsync(dsn: string): BTreeConnection {
         if (verify) {
             let caPem = if (caFile != "") File.readText(caFile) else "";
             let ts = await asynctls.tlsConnectVerify(host, port, caPem);
-            return await btStartup(ts);
+            return await btStartup(ts, user, dbname, password);
         }
         let ts2 = await asynctls.tlsConnect(host, port, false);
-        return await btStartup(ts2);
+        return await btStartup(ts2, user, dbname, password);
     }
     let stream = await aio.asyncConnect(host, port);
-    return await btStartup(stream);
+    return await btStartup(stream, user, dbname, password);
 }
 
 // Run startup over `io` (plaintext AsyncStream or TlsStream, both AsyncIO). Passing the concrete stream
-// into this AsyncIO param is a widening (the safe direction).
-async fn btStartup(io: aio.AsyncIO): BTreeConnection {
+// into this AsyncIO param is a widening (the safe direction). The startup frame carries the DSN user +
+// database; if the server issues an AuthenticationCleartextPassword request ('R' method 3), the DSN
+// password is sent back as a 'p' frame. NOTE: today's btree server (proto/session.zig) accepts startup
+// unconditionally — it replies AuthOk (method 0) without challenging — so the password path is dormant
+// but correct-by-construction for when the server enforces auth. SASL (method 10) is not yet supported.
+async fn btStartup(io: aio.AsyncIO, user: string, dbname: string, password: string): BTreeConnection {
     let reader = BtReader(io);
-    let sn = await sendFrame(io, buildStartupFrame("admin", "nova"));
+    let sn = await sendFrame(io, buildStartupFrame(user, dbname));
     while (true) {
         let f = await readFrame(reader);
         if (f.ftype == -1) { break; }
-        if (f.ftype == 90) { break; }   // 'Z' ReadyForQuery
+        if (f.ftype == 82) {                     // 'R' Authentication request
+            let method = authMethod(f.payload);
+            if (method == 3) {                   // AuthenticationCleartextPassword
+                let ps = await sendFrame(io, buildPasswordFrame(password));
+            }
+        }
+        if (f.ftype == 90) { break; }            // 'Z' ReadyForQuery
     }
     return BTreeConnection(io, reader);
 }

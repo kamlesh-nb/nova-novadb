@@ -136,3 +136,102 @@ fn test_multidigit_param_and_blob(): void {
     pb.push(db.dbBlob("Hi"));
     assert.equalStr(btreedb.substituteParams("$1", pb), "'\\x4869'");
 }
+
+// --- T14: extended query protocol (Parse/Bind/Execute/Sync) frame bytes -------
+
+@test
+fn test_parse_frame_encoding(): void {
+    // Parse 'P' (80): [stmt][sql][u16 param_count][u32 oid]*. One int param (dbInt -> Int4 oid 2).
+    let params = List<DbValue>();
+    params.push(db.dbInt(7));
+    let f = btreedb.buildParseFrame("s0", "SELECT * FROM t WHERE id = $1", params);
+    assert.equalInt(f[0], 80);                 // 'P'
+    // Payload = s16("s0") + s16(sql) + u16(1) + u32(2). Assert framed length header + payload structure.
+    let sql = "SELECT * FROM t WHERE id = $1";
+    let expectPayload = s16("s0") + s16(sql) + u16b(1) + u32b(2);
+    // Framed = [80][u32 len=4+payloadLen][payload].
+    assert.equalInt(f.length, 5 + expectPayload.length);
+    // Length field is big-endian 4 + payloadLen.
+    let plen = 4 + expectPayload.length;
+    assert.equalInt(f[1], (plen / 16777216) % 256);
+    assert.equalInt(f[2], (plen / 65536) % 256);
+    assert.equalInt(f[3], (plen / 256) % 256);
+    assert.equalInt(f[4], plen % 256);
+    // Payload bytes match exactly (stmt name, sql, param count 1, oid 2).
+    let tail = string.slice(f, 5, f.length);
+    assert.equalStr(tail, expectPayload);
+}
+
+@test
+fn test_parse_param_oids_by_kind(): void {
+    // Each bound value's kind maps to its wire OID in the Parse frame.
+    let params = List<DbValue>();
+    params.push(db.dbText("x"));      // oid 9 (text)
+    params.push(db.dbBool(true));     // oid 1 (bool)
+    params.push(db.dbLong(5));        // oid 3 (int8)
+    params.push(db.dbDouble(1.5));    // oid 7 (float8)
+    let f = btreedb.buildParseFrame("s1", "$1$2$3$4", params);
+    // Payload tail: after s16("s1") + s16("$1$2$3$4") + u16(4) come four u32 OIDs.
+    let head = s16("s1") + s16("$1$2$3$4") + u16b(4);
+    let oids = u32b(9) + u32b(1) + u32b(3) + u32b(7);
+    let expectPayload = head + oids;
+    let tail = string.slice(f, 5, f.length);
+    assert.equalStr(tail, expectPayload);
+}
+
+@test
+fn test_bind_frame_encoding(): void {
+    // Bind 'B' (66): [portal][stmt][u16 fmt_count=0][u16 param_count][value]*[u16 rfmt_count=0].
+    // value = [i32 len][bytes] (text format), or i32 -1 for NULL. Server re-quotes by class,
+    // so the raw text ("o'brien") is sent UNescaped (unlike the simple-query path).
+    let params = List<DbValue>();
+    params.push(db.dbInt(42));          // "42"
+    params.push(db.dbText("o'brien"));  // "o'brien" (raw, not doubled)
+    params.push(db.dbNull());           // i32 -1
+    let f = btreedb.buildBindFrame("s0", "s0", params);
+    assert.equalInt(f[0], 66);          // 'B'
+    let val42 = u32b(2) + "42";
+    let valTxt = u32b(7) + "o'brien";
+    // i32 -1 = 0xFFFFFFFF.
+    let valNull = u32b(4294967295);
+    let expectPayload = s16("s0") + s16("s0") + u16b(0) + u16b(3) + val42 + valTxt + valNull + u16b(0);
+    let tail = string.slice(f, 5, f.length);
+    assert.equalStr(tail, expectPayload);
+}
+
+@test
+fn test_execute_and_sync_frames(): void {
+    // Execute 'E' (69): [portal][u32 max_rows].
+    let e = btreedb.buildExecuteFrame("s0", 0);
+    assert.equalInt(e[0], 69);          // 'E'
+    let expectE = s16("s0") + u32b(0);
+    assert.equalStr(string.slice(e, 5, e.length), expectE);
+
+    // Sync 'S' (83): empty payload; framed length is exactly 5 (type + u32 len=4).
+    let s = btreedb.buildSyncFrame();
+    assert.equalInt(s[0], 83);          // 'S'
+    assert.equalInt(s.length, 5);
+    assert.equalInt(s[4], 4);           // len = 4 (includes itself, no payload)
+}
+
+@test
+fn test_password_and_auth_method(): void {
+    // Password 'p' (112): [u16 len][password].
+    let f = btreedb.buildPasswordFrame("s3cret");
+    assert.equalInt(f[0], 112);         // 'p'
+    assert.equalStr(string.slice(f, 5, f.length), s16("s3cret"));
+
+    // Auth 'R' payload decode: a u32 method. 3 = cleartext password request.
+    let payload = u32b(3);
+    assert.equalInt(btreedb.authMethod(payload), 3);
+    assert.equalInt(btreedb.authMethod(u32b(0)), 0);   // AuthenticationOk
+}
+
+@test
+fn test_startup_frame_carries_creds(): void {
+    // Startup 'H' (72): [u16 major][u16 minor][user][db]["nova-driver"]. Wires the DSN user/db.
+    let f = btreedb.buildStartupFrame("kamlesh", "shop");
+    assert.equalInt(f[0], 72);          // 'H'
+    let expect = u16b(1) + u16b(0) + s16("kamlesh") + s16("shop") + s16("nova-driver");
+    assert.equalStr(string.slice(f, 5, f.length), expect);
+}
