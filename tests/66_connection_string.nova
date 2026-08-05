@@ -1,0 +1,68 @@
+// The NovaDB connection-string parser (connection.nova) — gated OFFLINE (pure string work, no
+// I/O). Proves the driver honours the advertised `novadb://` URL form AND the bare `host:port`
+// form identically, plus userinfo credentials, `?db=`/`?tls=` query params, a trailing `/path`,
+// and the default port. This is what lets `storeConnectionString`'s `novadb://…` DSN connect.
+import assert;
+import string;
+import connection;
+
+// A scheme-prefixed URL and the bare host:port parse to the same host/port.
+@test
+fn scheme_and_bare_agree(): void {
+    let a = connection.parse("novadb://127.0.0.1:3009");
+    let b = connection.parse("127.0.0.1:3009");
+    assert.equalStr(a.host, "127.0.0.1");
+    assert.equalInt(a.port, 3009);
+    assert.equalStr(b.host, "127.0.0.1");
+    assert.equalInt(b.port, 3009);
+}
+
+// Any scheme is stripped (the driver does not care what the scheme spells).
+@test
+fn strips_arbitrary_scheme(): void {
+    let o = connection.parse("btreedb://db.internal:5000");
+    assert.equalStr(o.host, "db.internal");
+    assert.equalInt(o.port, 5000);
+}
+
+// `user:pass@` userinfo overrides the defaults; works with the scheme present.
+@test
+fn userinfo_credentials(): void {
+    let o = connection.parse("novadb://app:secret@127.0.0.1:3009");
+    assert.equalStr(o.host, "127.0.0.1");
+    assert.equalInt(o.port, 3009);
+    assert.equalStr(o.user, "app");
+    assert.equalStr(o.password, "secret");
+}
+
+// Query params: db name and TLS mode. This is exactly the shape storeConnectionString emits.
+@test
+fn query_params(): void {
+    let o = connection.parse("novadb://app:secret@127.0.0.1:3009?db=shop&tls=verify&tlsCAFile=/etc/ca.pem");
+    assert.equalStr(o.dbname, "shop");
+    assert.isTrue(o.useTls);
+    assert.isTrue(o.verify);
+    assert.equalStr(o.caFile, "/etc/ca.pem");
+    // userinfo still parsed with a query string present
+    assert.equalStr(o.user, "app");
+    assert.equalStr(o.password, "secret");
+}
+
+// A trailing `/path` after host:port is not the port.
+@test
+fn trailing_path_is_not_port(): void {
+    let o = connection.parse("novadb://127.0.0.1:3009/shop");
+    assert.equalStr(o.host, "127.0.0.1");
+    assert.equalInt(o.port, 3009);
+}
+
+// No port -> the default 3009; defaults for user/db when unspecified.
+@test
+fn defaults(): void {
+    let o = connection.parse("novadb://localhost");
+    assert.equalStr(o.host, "localhost");
+    assert.equalInt(o.port, 3009);
+    assert.equalStr(o.user, "admin");
+    assert.equalStr(o.dbname, "nova");
+    assert.isTrue(!o.useTls);
+}

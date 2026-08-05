@@ -43,6 +43,12 @@ pub fn parse(connectionString: string): ConnectionOptions {
     let qq = string.indexOf(base, "?");
     if (qq != -1) { base = string.slice(base, 0, qq); }
 
+    // Strip an optional `scheme://` prefix so the advertised URL form works, not just the bare
+    // `host:port`. Both `novadb://user:pass@host:port?db=shop` and `host:port` now parse the same.
+    // Must happen before the host:port split, since the `://` colons would otherwise fool lastIndexOf.
+    let sep = string.indexOf(base, "://");
+    if (sep != -1) { base = string.slice(base, sep + 3, base.length); }
+
     // Credentials from the connection string. `user=`/`password=`/`db=` query params provide defaults; a
     // `user:pass@host:port` userinfo prefix (if present) overrides user/password. Real creds now
     // flow into the startup + auth handshake instead of the previously hardcoded "admin"/"nova".
@@ -61,6 +67,10 @@ pub fn parse(connectionString: string): ConnectionOptions {
             password = string.slice(userinfo, uc + 1, userinfo.length);
         }
     }
+
+    // A trailing `/path` (e.g. `host:port/shop`) is not the port; drop it before the host:port split.
+    let slash = string.indexOf(base, "/");
+    if (slash != -1) { base = string.slice(base, 0, slash); }
 
     let colon = string.lastIndexOf(base, ":");
     let host = colon == -1 ? base : string.slice(base, 0, colon);
