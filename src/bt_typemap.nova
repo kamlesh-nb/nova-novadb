@@ -1,0 +1,175 @@
+// bt_typemap — type mapping between NovaDB's wire types and the `db` seam
+// (SRP: types & values only). Three jobs:
+//   - OID -> DbType                   (oidToDbType)
+//   - bound DbValue -> wire OID / bind text (paramOid, paramValueText, bindValue)
+//   - wire text -> typed DbValue      (decodeCell)
+//   - DbValue -> inline SQL literal   (valueToSql + escaping, substituteParams)
+// Pure over strings + the db value model; no socket, no framing. bt_codec depends on this
+// (one-way): the frame builders call paramOid/bindValue and the row decoders call decodeCell.
+import string;
+import list;
+import bytes;
+import db;
+
+// A local big-endian u32 writer (bindValue prefixes each bound value with its i32 length). Kept
+// private here so bt_typemap stays a LEAF (no dependency on bt_codec's frame writers) — mirrors the
+// codec's u32be byte-for-byte.
+fn beU32(v: int): string {
+    let p = bytes.alloc(4);
+    bytes.write_byte(p, 0, (v / 16777216) % 256);
+    bytes.write_byte(p, 1, (v / 65536) % 256);
+    bytes.write_byte(p, 2, (v / 256) % 256);
+    bytes.write_byte(p, 3, v % 256);
+    return p as string;
+}
+
+// --- Type OIDs (btree proto/wire.zig) -> seam DbType -------------------------
+pub fn oidToDbType(oid: int): DbType {
+    if (oid == 1) { return DbType.Bool; }
+    if (oid == 2) { return DbType.Int4; }
+    if (oid == 3) { return DbType.Int8; }
+    if (oid == 4) { return DbType.Uint4; }
+    if (oid == 5) { return DbType.Uint8; }
+    if (oid == 6) { return DbType.Float4; }
+    if (oid == 7) { return DbType.Float8; }
+    if (oid == 8) { return DbType.Timestamp; }
+    if (oid == 9) { return DbType.Text; }
+    if (oid == 10) { return DbType.Blob; }
+    if (oid == 11) { return DbType.Decimal; }
+    return DbType.Text;
+}
+
+// --- Bound DbValue -> wire OID / bind text (extended-query Parse/Bind) --------
+// Map a bound value's kind to the wire type OID the server classifies for escaping.
+// Timestamp is carried as ISO text, so it is declared as text(9) => quoted (a numeric class would
+// reject the ISO string as a non-numeric literal server-side).
+pub fn paramOid(v: DbValue): int {
+    if (v.isNull()) { return 9; }                 // text class (safe quoting)
+    let k = v.kind;
+    if (k == DbType.Bool) { return 1; }
+    if (k == DbType.Int4) { return 2; }
+    if (k == DbType.Int8) { return 3; }
+    if (k == DbType.Uint4) { return 4; }
+    if (k == DbType.Uint8) { return 5; }
+    if (k == DbType.Float4) { return 6; }
+    if (k == DbType.Float8) { return 7; }
+    if (k == DbType.Text) { return 9; }
+    if (k == DbType.Blob) { return 10; }
+    if (k == DbType.Decimal) { return 11; }
+    return 9;                                       // Timestamp + fallback -> text class
+}
+
+// The RAW text-format value for a bound param (the server applies class escaping, so no quoting here).
+fn paramValueText(v: DbValue): string {
+    if (v.kind == DbType.Bool) { if (v.asBool()) { return "true"; } return "false"; }
+    if (v.kind == DbType.Text || v.kind == DbType.Blob) { return v.asText(); }
+    if (v.kind == DbType.Timestamp || v.kind == DbType.Decimal) { return v.asText(); }
+    if (v.kind == DbType.Float4 || v.kind == DbType.Float8) {
+        let d = v.asDouble();
+        return `${d}`;
+    }
+    let iv = v.asLong();
+    return `${iv}`;
+}
+
+// Encode one Bind param VALUE: [i32 len][bytes], or i32 -1 for NULL.
+pub fn bindValue(v: DbValue): string {
+    if (v.isNull()) {
+        let p = bytes.alloc(4);
+        bytes.write_byte(p, 0, 255);
+        bytes.write_byte(p, 1, 255);
+        bytes.write_byte(p, 2, 255);
+        bytes.write_byte(p, 3, 255);   // i32 -1 (0xFFFFFFFF) = SQL NULL
+        return p as string;
+    }
+    let t = paramValueText(v);
+    return beU32(t.length) + t;
+}
+
+// --- wire text -> typed DbValue -----------------------------------------------
+// Decode one text-format value into a typed cell for the given column type.
+pub fn decodeCell(t: DbType, raw: string, isNull: bool): DbValue {
+    if (isNull) { return db.dbNull(); }
+    if (t == DbType.Bool) {
+        let tru = string.eql(raw, "true") || string.eql(raw, "t") || string.eql(raw, "1");
+        return db.dbBool(tru);
+    }
+    if (t == DbType.Int4 || t == DbType.Uint4) { return db.dbInt(string.parseI64(raw)); }
+    if (t == DbType.Int8 || t == DbType.Uint8 || t == DbType.Timestamp) { return db.dbLong(string.parseI64(raw)); }
+    if (t == DbType.Float4 || t == DbType.Float8) { return db.dbDouble(string.parseFloat(raw)); }
+    if (t == DbType.Decimal) {
+        // S4: parse the exact text into a decimal128 (.dec, via asDecimal()); keep the raw
+        // text in .s (asText) too.
+        return DbValue(DbType.Decimal, 0, 0.0, decimal.fromString(raw), raw);
+    }
+    return db.dbText(raw);   // Text / Blob
+}
+
+// --- Client-side parameter substitution --------------------------------------
+// The simple-query path takes SQL text only, so $1..$N are substituted here with the SAME
+// escaping the server uses (btree proto/command.zig): text single-quoted with doubled
+// quotes, numeric/decimal inserted raw, bool -> true/false, NULL -> NULL. Injection-safe
+// because a text value's quotes are doubled and it is never re-parsed as SQL structure.
+// This is used by the SIMPLE-query ('Q') path (query/exec). The prepared methods now use the
+// EXTENDED Parse/Bind/Execute path where the SERVER substitutes — see buildParseFrame (bt_codec).
+fn escapeText(s: string): string {
+    let out = "'";
+    let i = 0;
+    let n = s.length;
+    while (i < n) {
+        let ch = s[i];
+        if (ch == 39) { out = out + "''"; }   // ' -> ''
+        else { out = out + string.slice(s, i, i + 1); }
+        i = i + 1;
+    }
+    return out + "'";
+}
+// bytea literal '\xHEX' -- binary-safe (NUL/quotes), unlike text-escaping raw bytes.
+fn byteaLiteral(s: string): string {
+    let out = "'\\x";
+    let i = 0;
+    while (i < s.length) {
+        let b = s[i];
+        out = out + btHexDigit((b / 16) & 15) + btHexDigit(b & 15);
+        i = i + 1;
+    }
+    return out + "'";
+}
+fn btHexDigit(v: int): string {
+    if (v < 10) { return string.slice("0123456789", v, v + 1); }
+    return string.slice("abcdef", v - 10, v - 10 + 1);
+}
+fn valueToSql(v: DbValue): string {
+    if (v.isNull()) { return "NULL"; }
+    if (v.kind == DbType.Bool) { if (v.asBool()) { return "true"; } return "false"; }
+    if (v.kind == DbType.Blob) { return byteaLiteral(v.asText()); }
+    if (v.kind == DbType.Text) { return escapeText(v.asText()); }
+    if (v.kind == DbType.Decimal) { return v.asText(); }   // decimal carried as text
+    if (v.kind == DbType.Float4 || v.kind == DbType.Float8) {
+        let d = v.asDouble();
+        return `${d}`;
+    }
+    let iv = v.asLong();
+    return `${iv}`;
+}
+pub fn substituteParams(sql: string, params: List<DbValue>): string {
+    let out = "";
+    let i = 0;
+    let n = sql.length;
+    while (i < n) {
+        let ch = sql[i];
+        // '$' + one or more digits -> parameter N (1-based). Multi-digit required for >9-column ORM inserts.
+        if (ch == 36 && i + 1 < n && sql[i + 1] >= 48 && sql[i + 1] <= 57) {
+            let j = i + 1;
+            let num = 0;
+            while (j < n && sql[j] >= 48 && sql[j] <= 57) { num = num * 10 + (sql[j] - 48); j = j + 1; }
+            let p = params.get(num - 1) ?? db.dbNull();
+            out = out + valueToSql(p);
+            i = j;
+        } else {
+            out = out + string.slice(sql, i, i + 1);
+            i = i + 1;
+        }
+    }
+    return out;
+}

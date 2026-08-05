@@ -1,5 +1,5 @@
 {
-  "name": "nova-btreedb",
+  "name": "nova-novadb",
   "version": "0.1.0",
   "type": "library",
   "dependencies": []

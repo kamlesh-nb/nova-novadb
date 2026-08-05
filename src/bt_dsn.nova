@@ -1,0 +1,70 @@
+// bt_dsn — NovaDB connection-string parsing (SRP: DSN only).
+// `btreedb://user[:password]@host[:port]/... ?db=..&tls=..&tlsCAFile=..`  (host:port is the
+// minimal form; the query params + `user:pass@` userinfo supply the rest). Pure string work;
+// no I/O, no db seam. The seam (btreedb.nova) turns a BtDsn into a live connection.
+import string;
+
+pub struct BtDsn {
+    pub host: string,
+    pub port: int,
+    pub user: string,
+    pub password: string,
+    pub dbname: string,
+    pub useTls: bool,      // tls=true|verify
+    pub verify: bool,      // tls=verify (validate the server cert against tlsCAFile)
+    pub caFile: string,    // path to a PEM CA bundle (verify)
+    init(host: string, port: int, user: string, password: string, dbname: string, useTls: bool, verify: bool, caFile: string) {
+        self.host = host; self.port = port; self.user = user;
+        self.password = password; self.dbname = dbname;
+        self.useTls = useTls; self.verify = verify; self.caFile = caFile;
+    }
+}
+
+// Pull `key=value` out of a `?a=b&c=d` DSN query string (returns `dflt` if absent).
+fn dsnParam(dsn: string, key: string, dflt: string): string {
+    let needle = key + "=";
+    let idx = string.indexOf(dsn, needle);
+    if (idx == -1) { return dflt; }
+    let rest = string.slice(dsn, idx + needle.length, dsn.length);
+    let amp = string.indexOf(rest, "&");
+    if (amp == -1) { return rest; }
+    return string.slice(rest, 0, amp);
+}
+
+// Parse the DSN into its parts. DSN is `host:port` with optional `user:pass@` userinfo prefix and
+// `?db=..&tls=..&tlsCAFile=..` query params.
+pub fn parseDsn(dsn: string): BtDsn {
+    let tlsOpt = dsnParam(dsn, "tls", "false");
+    let useTls = string.eql(tlsOpt, "true") || string.eql(tlsOpt, "verify");
+    let verify = string.eql(tlsOpt, "verify");
+    let caFile = dsnParam(dsn, "tlsCAFile", "");
+
+    let base = dsn;
+    let qq = string.indexOf(base, "?");
+    if (qq != -1) { base = string.slice(base, 0, qq); }
+
+    // Credentials from the DSN. `user=`/`password=`/`db=` query params provide defaults; a
+    // `user:pass@host:port` userinfo prefix (if present) overrides user/password. Real creds now
+    // flow into the startup + auth handshake instead of the previously hardcoded "admin"/"nova".
+    let user = dsnParam(dsn, "user", "admin");
+    let password = dsnParam(dsn, "password", "");
+    let dbname = dsnParam(dsn, "db", "nova");
+    let at = string.indexOf(base, "@");
+    if (at != -1) {
+        let userinfo = string.slice(base, 0, at);
+        base = string.slice(base, at + 1, base.length);
+        let uc = string.indexOf(userinfo, ":");
+        if (uc == -1) {
+            user = userinfo;
+        } else {
+            user = string.slice(userinfo, 0, uc);
+            password = string.slice(userinfo, uc + 1, userinfo.length);
+        }
+    }
+
+    let colon = string.lastIndexOf(base, ":");
+    let host = colon == -1 ? base : string.slice(base, 0, colon);
+    let port = colon == -1 ? 3009 : string.parseI64(string.slice(base, colon + 1, base.length));
+
+    return BtDsn(host, port, user, password, dbname, useTls, verify, caFile);
+}

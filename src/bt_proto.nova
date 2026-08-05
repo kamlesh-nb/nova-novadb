@@ -1,0 +1,96 @@
+// bt_proto — the async transport framing (SRP: read/write whole protocol frames off a
+// live stream). Buffered reader over an AsyncIO; the socket I/O is non-blocking — `fill`
+// awaits `io.recvInto`, which PARKS the coroutine (asio arecv) instead of blocking the
+// scheduler thread. `io` is an AsyncStream; a TLS variant (TlsStream) drops in unchanged
+// via the shared recvInto shape. Knows framing bytes only — payload MEANING lives in bt_codec.
+import net.aio;
+import bytes;
+
+// --- Buffered frame reader over a live TCP stream ----------------------------
+pub struct BtReader {
+    pub io: aio.AsyncIO,   // A1 async-first: `fill` awaits io.recvInto (parks, no thread held)
+    pub buf: ptr,
+    pub cap: int,
+    pub len: int,
+    pub pos: int,
+    init(io: aio.AsyncIO) {
+        self.io = io;
+        self.cap = 65536;
+        self.buf = bytes.alloc(65536);
+        self.len = 0;
+        self.pos = 0;
+    }
+
+    // `buf` is a raw byte buffer (a `ptr`, not an ARC-managed field), so ARC will not free it — it needs
+    // a cleanup hook, called only by the destructor. Without this the 64KB read buffer leaked per
+    // connection (the BtReader end-to-end leak).
+    fn delete(self: BtReader): void {
+        if (self.buf != 0) {
+            bytes.free(self.buf);
+            self.buf = 0;
+        }
+    }
+}
+async fn fill(r: BtReader): bool {
+    if (r.pos > 0) {
+        let i = 0;
+        while (r.pos + i < r.len) {
+            bytes.write_byte(r.buf, i, bytes.read_byte(r.buf, r.pos + i));
+            i = i + 1;
+        }
+        r.len = r.len - r.pos;
+        r.pos = 0;
+    }
+    let space = r.cap - r.len;
+    let n = await r.io.recvInto((r.buf + r.len) as int, space);   // parks the coroutine
+    if (n <= 0) { return false; }
+    r.len = r.len + n;
+    return true;
+}
+async fn need(r: BtReader, k: int): bool {
+    while (r.len - r.pos < k) { if (!(await fill(r))) { return false; } }
+    return true;
+}
+fn rbyte(r: BtReader): int { let b = bytes.read_byte(r.buf, r.pos); r.pos = r.pos + 1; return b; }
+fn ru32(r: BtReader): int {
+    let a = rbyte(r); let b = rbyte(r); let c = rbyte(r); let d = rbyte(r);
+    return ((a * 256 + b) * 256 + c) * 256 + d;
+}
+
+// A raw protocol frame: [type:byte][len:u32][payload]. `ftype == -1` = broken connection.
+pub struct BtFrame {
+    pub ftype: int,
+    pub payload: string,
+    init(ftype: int, payload: string) { self.ftype = ftype; self.payload = payload; }
+}
+pub async fn readFrame(r: BtReader): BtFrame {
+    if (!(await need(r, 5))) { return BtFrame(-1, ""); }
+    let t = rbyte(r);
+    let len = ru32(r);
+    let plen = len - 4;
+    // Defensive: a corrupt/partial length (server crashed mid-stream, or a protocol
+    // desync under concurrent load) must NOT reach bytes.alloc — a negative plen or a
+    // multi-GB plen segfaults the client. Treat anything out of range as a broken
+    // connection and return the error frame the callers already handle.
+    if (plen < 0 || plen > 67108864) { return BtFrame(-1, ""); }
+    if (plen > 0) {
+        if (!(await need(r, plen))) { return BtFrame(-1, ""); }
+    }
+    let out = bytes.alloc(plen);
+    let i = 0;
+    while (i < plen) {
+        bytes.write_byte(out, i, bytes.read_byte(r.buf, r.pos + i));
+        i = i + 1;
+    }
+    r.pos = r.pos + plen;
+    // Bind the `as string` cast to a local so it is registered as an owned temporary — an inline
+    // `out as string` cast-of-a-buffer as a constructor arg is NOT tracked as owned (the ARC-edge in the
+    // deferred backlog), so the frame payload leaked. Binding first is the clean pattern.
+    let payload = out as string;
+    return BtFrame(t, payload);
+}
+
+pub async fn sendFrame(io: aio.AsyncIO, frame: string): int {
+    // Binary-safe: send exactly frame.length bytes (embedded NULs and all). Parks on the write.
+    return await io.sendStr(frame);
+}

@@ -1,0 +1,209 @@
+// bt_codec — the NovaDB binary wire CODEC (SRP: bytes <-> messages). Frame BUILDERS
+// (Startup/Query/Terminate/Password + extended-query Parse/Bind/Execute/Sync) and response
+// DECODERS (RowDescription, DataRow, CommandComplete, Authentication, ErrorResponse). Pure
+// over byte-buffer strings — the offline gate calls these directly; the connection (btreedb.nova)
+// wires them to a live stream via bt_proto. Type interpretation is delegated to bt_typemap.
+//
+// Framing: [type:u8][len:u32 BE][payload], len includes its own 4 bytes (pg convention).
+import string;
+import list;
+import bytes;
+import db;
+import bt_typemap;
+
+// --- BtFrame writers — build framed messages as binary-safe Nova strings --------
+fn byte1(b: int): string {
+    let p = bytes.alloc(1);
+    bytes.write_byte(p, 0, b);
+    return p as string;
+}
+fn u16be(v: int): string {
+    let p = bytes.alloc(2);
+    bytes.write_byte(p, 0, (v / 256) % 256);
+    bytes.write_byte(p, 1, v % 256);
+    return p as string;
+}
+fn u32be(v: int): string {
+    let p = bytes.alloc(4);
+    bytes.write_byte(p, 0, (v / 16777216) % 256);
+    bytes.write_byte(p, 1, (v / 65536) % 256);
+    bytes.write_byte(p, 2, (v / 256) % 256);
+    bytes.write_byte(p, 3, v % 256);
+    return p as string;
+}
+fn wstr16(s: string): string { return u16be(s.length) + s; }
+fn frameOf(t: int, payload: string): string { return byte1(t) + u32be(4 + payload.length) + payload; }
+
+/// Build the frames (pub for offline encode gating).
+pub fn buildStartupFrame(user: string, dbname: string): string {
+    let sp = u16be(1) + u16be(0) + wstr16(user) + wstr16(dbname) + wstr16("nova-driver");
+    return frameOf(72, sp);   // 'H'
+}
+pub fn buildQueryFrame(sql: string): string { return frameOf(81, wstr16(sql)); } // 'Q'
+pub fn buildTerminateFrame(): string { return frameOf(88, ""); }                 // 'X'
+
+// A cleartext-password response ('p') — sent only if the server issues an AuthenticationCleartextPassword
+// request (method 3). The current btree server accepts startup unconditionally (session.zig sends AuthOk
+// method 0 without challenging), so this frame is dormant against today's server but keeps the driver
+// correct if the server later enforces password auth.
+pub fn buildPasswordFrame(password: string): string { return frameOf(112, wstr16(password)); } // 'p'
+
+// --- Extended query protocol: Parse / Bind / Execute / Sync (T14) ------------
+// The btree server implements the extended path SERVER-SIDE (btree proto/session.zig):
+//   'P' Parse   -> stores a named prepared statement + a ParamClass per declared param OID
+//   'B' Bind    -> looks up the statement, substitutes the bound param VALUES into the SQL
+//                  server-side (proto/command.zig, class-driven escaping), creates a portal
+//   'E' Execute -> runs the portal, streams RowDescription/DataRow*/CommandComplete
+//   'S' Sync    -> flushes and replies ReadyForQuery ('Z')
+// So Bind is REAL server-side substitution (the client sends raw typed values; the server quotes/
+// validates), not the client-side text splice the simple-query path uses. The Parse declares each
+// param's type OID; the server maps OID -> class (text/blob=quoted, bool=normalized, else=numeric-
+// validated). Bind param VALUES are sent in TEXT format ([i32 len][bytes], len -1 = NULL); the server
+// ignores the format codes and re-quotes by class, so we send raw unescaped text here (NOT the escaped
+// literal the simple path builds). The kind->OID mapping and value encoding live in bt_typemap.
+
+/// Parse ('P'): [stmt_name][sql][u16 param_count][u32 oid]*  — declares a named statement.
+pub fn buildParseFrame(name: string, sql: string, params: List<DbValue>): string {
+    let p = wstr16(name) + wstr16(sql) + u16be(params.size());
+    let i = 0;
+    while (i < params.size()) {
+        p = p + u32be(bt_typemap.paramOid(params.get(i) ?? db.dbNull()));
+        i = i + 1;
+    }
+    return frameOf(80, p);   // 'P'
+}
+
+/// Bind ('B'): [portal][stmt][u16 fmt_count=0][u16 param_count][value]*[u16 result_fmt_count=0].
+/// 0 param formats => all text (server re-quotes by class); 0 result formats => text results.
+pub fn buildBindFrame(portal: string, stmt: string, params: List<DbValue>): string {
+    let p = wstr16(portal) + wstr16(stmt) + u16be(0) + u16be(params.size());
+    let i = 0;
+    while (i < params.size()) {
+        p = p + bt_typemap.bindValue(params.get(i) ?? db.dbNull());
+        i = i + 1;
+    }
+    p = p + u16be(0);        // 0 result formats
+    return frameOf(66, p);   // 'B'
+}
+
+/// Execute ('E'): [portal][u32 max_rows]. max_rows 0 = all rows in one stream.
+pub fn buildExecuteFrame(portal: string, maxRows: int): string {
+    return frameOf(69, wstr16(portal) + u32be(maxRows));   // 'E'
+}
+
+/// Sync ('S'): empty payload; the server replies ReadyForQuery ('Z').
+pub fn buildSyncFrame(): string { return frameOf(83, ""); }   // 'S'
+
+// A per-handle statement/portal name. The server replaces a same-named prepared statement on re-Parse,
+// so reusing the name across calls of the same handle is safe (and cheap).
+pub fn stmtName(handle: int): string { return `s${handle}`; }
+
+// --- Payload cursor (decode, pure over a byte-buffer string) ------------------
+struct BtCursor {
+    pub s: string,
+    pub pos: int,
+    init(s: string) { self.s = s; self.pos = 0; }
+
+    pub fn byte(self: BtCursor): int {
+        let b = self.s[self.pos];
+        self.pos = self.pos + 1;
+        return b;
+    }
+    pub fn ushort(self: BtCursor): int {
+        let hi = self.byte();
+        let lo = self.byte();
+        return hi * 256 + lo;
+    }
+    pub fn uint(self: BtCursor): int {
+        let a = self.byte();
+        let b = self.byte();
+        let c = self.byte();
+        let d = self.byte();
+        return ((a * 256 + b) * 256 + c) * 256 + d;
+    }
+    pub fn str16(self: BtCursor): string {
+        let n = self.ushort();
+        let out = string.slice(self.s, self.pos, self.pos + n);
+        self.pos = self.pos + n;
+        return out;
+    }
+    pub fn skip(self: BtCursor, n: int): void { self.pos = self.pos + n; }
+}
+
+// --- Response decoders (pure; the offline gate calls these directly) ----------
+
+/// Decode a RowDescription ('T') payload into typed columns.
+/// Layout: field_count(u16) + per field {name(str16), table_id(u32), col_no(u16),
+/// type_oid(u32), type_size(i16), type_mod(i32), format(u16)}.
+pub fn decodeRowDesc(payload: string): List<Column> {
+    let cols = List<Column>();
+    let c = BtCursor(payload);
+    let n = c.ushort();
+    let i = 0;
+    while (i < n) {
+        let name = c.str16();
+        c.skip(4);            // table_id
+        c.skip(2);            // col_no
+        let oid = c.uint();   // type_oid
+        c.skip(2);            // type_size
+        c.skip(4);            // type_mod
+        c.skip(2);            // format (text on the simple-query path)
+        cols.push(Column(name, bt_typemap.oidToDbType(oid)));
+        i = i + 1;
+    }
+    return cols;
+}
+
+/// Decode a DataRow ('D') payload into a typed Row, using the columns' types.
+/// Layout: field_count(u16) + per field {len(i32, -1=NULL), bytes}.
+pub fn decodeDataRow(payload: string, cols: List<Column>): Row {
+    let row = Row();
+    let c = BtCursor(payload);
+    let n = c.ushort();
+    let i = 0;
+    while (i < n) {
+        let len = c.uint();
+        let col = cols.get(i) ?? Column("", DbType.Text);
+        // NULL is the wire's -1 length. The 4 BE bytes 0xFFFFFFFF read back as the signed
+        // i32 -1 (when int arithmetic is 32-bit) or as 4294967295 (when 64-bit) — accept both,
+        // so the NULL sentinel is detected regardless of int width.
+        if (len == 4294967295 || len == -1) {
+            row.cells.push(bt_typemap.decodeCell(col.type_oid, "", true));
+        } else {
+            let raw = string.slice(c.s, c.pos, c.pos + len);
+            c.skip(len);
+            row.cells.push(bt_typemap.decodeCell(col.type_oid, raw, false));
+        }
+        i = i + 1;
+    }
+    return row;
+}
+
+/// Decode a CommandComplete ('C') payload -> tag string (e.g. "SELECT 2" / "OK 1").
+pub fn decodeTag(payload: string): string {
+    let c = BtCursor(payload);
+    return c.str16();
+}
+
+/// Decode an Authentication ('R') payload -> the u32 method (0=Ok, 3=CleartextPassword, 10=SASL).
+pub fn authMethod(payload: string): int {
+    let c = BtCursor(payload);
+    return c.uint();
+}
+
+/// Decode an ErrorResponse ('E') payload {severity(str16), code(str16), message(str16)}.
+pub fn decodeError(payload: string): DbError {
+    let c = BtCursor(payload);
+    let sev = c.str16();
+    let code = c.str16();
+    let msg = c.str16();
+    return DbError(code, msg);
+}
+
+// "OK 5" / "SELECT 3" -> the trailing count as a long (0 if absent).
+pub fn tagCount(tag: string): int {
+    let sp = string.lastIndexOf(tag, " ");
+    if (sp == -1) { return 0; }
+    let num = string.slice(tag, sp + 1, tag.length);
+    return string.parseI64(num);
+}
