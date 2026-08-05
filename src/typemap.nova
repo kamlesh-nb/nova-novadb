@@ -1,10 +1,10 @@
-// bt_typemap — type mapping between NovaDB's wire types and the `db` seam
+// typemap — type mapping between NovaDB's wire types and the `db` seam
 // (SRP: types & values only). Three jobs:
 //   - OID -> DbType                   (oidToDbType)
 //   - bound DbValue -> wire OID / bind text (paramOid, paramValueText, bindValue)
 //   - wire text -> typed DbValue      (decodeCell)
 //   - DbValue -> inline SQL literal   (valueToSql + escaping, substituteParams)
-// Pure over strings + the db value model; no socket, no framing. bt_codec depends on this
+// Pure over strings + the db value model; no socket, no framing. codec depends on this
 // (one-way): the frame builders call paramOid/bindValue and the row decoders call decodeCell.
 import string;
 import list;
@@ -12,7 +12,7 @@ import bytes;
 import db;
 
 // A local big-endian u32 writer (bindValue prefixes each bound value with its i32 length). Kept
-// private here so bt_typemap stays a LEAF (no dependency on bt_codec's frame writers) — mirrors the
+// private here so typemap stays a LEAF (no dependency on codec's frame writers) — mirrors the
 // codec's u32be byte-for-byte.
 fn beU32(v: int): string {
     let p = bytes.alloc(4);
@@ -111,7 +111,7 @@ pub fn decodeCell(t: DbType, raw: string, isNull: bool): DbValue {
 // quotes, numeric/decimal inserted raw, bool -> true/false, NULL -> NULL. Injection-safe
 // because a text value's quotes are doubled and it is never re-parsed as SQL structure.
 // This is used by the SIMPLE-query ('Q') path (query/exec). The prepared methods now use the
-// EXTENDED Parse/Bind/Execute path where the SERVER substitutes — see buildParseFrame (bt_codec).
+// EXTENDED Parse/Bind/Execute path where the SERVER substitutes — see buildParseFrame (codec).
 fn escapeText(s: string): string {
     let out = "'";
     let i = 0;

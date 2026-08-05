@@ -1,15 +1,15 @@
-// bt_codec — the NovaDB binary wire CODEC (SRP: bytes <-> messages). Frame BUILDERS
+// codec — the NovaDB binary wire CODEC (SRP: bytes <-> messages). Frame BUILDERS
 // (Startup/Query/Terminate/Password + extended-query Parse/Bind/Execute/Sync) and response
 // DECODERS (RowDescription, DataRow, CommandComplete, Authentication, ErrorResponse). Pure
-// over byte-buffer strings — the offline gate calls these directly; the connection (btreedb.nova)
-// wires them to a live stream via bt_proto. Type interpretation is delegated to bt_typemap.
+// over byte-buffer strings — the offline gate calls these directly; the connection (novadb.nova)
+// wires them to a live stream via proto. Type interpretation is delegated to typemap.
 //
 // Framing: [type:u8][len:u32 BE][payload], len includes its own 4 bytes (pg convention).
 import string;
 import list;
 import bytes;
 import db;
-import bt_typemap;
+import typemap;
 
 // --- BtFrame writers — build framed messages as binary-safe Nova strings --------
 fn byte1(b: int): string {
@@ -60,14 +60,14 @@ pub fn buildPasswordFrame(password: string): string { return frameOf(112, wstr16
 // param's type OID; the server maps OID -> class (text/blob=quoted, bool=normalized, else=numeric-
 // validated). Bind param VALUES are sent in TEXT format ([i32 len][bytes], len -1 = NULL); the server
 // ignores the format codes and re-quotes by class, so we send raw unescaped text here (NOT the escaped
-// literal the simple path builds). The kind->OID mapping and value encoding live in bt_typemap.
+// literal the simple path builds). The kind->OID mapping and value encoding live in typemap.
 
 /// Parse ('P'): [stmt_name][sql][u16 param_count][u32 oid]*  — declares a named statement.
 pub fn buildParseFrame(name: string, sql: string, params: List<DbValue>): string {
     let p = wstr16(name) + wstr16(sql) + u16be(params.size());
     let i = 0;
     while (i < params.size()) {
-        p = p + u32be(bt_typemap.paramOid(params.get(i) ?? db.dbNull()));
+        p = p + u32be(typemap.paramOid(params.get(i) ?? db.dbNull()));
         i = i + 1;
     }
     return frameOf(80, p);   // 'P'
@@ -79,7 +79,7 @@ pub fn buildBindFrame(portal: string, stmt: string, params: List<DbValue>): stri
     let p = wstr16(portal) + wstr16(stmt) + u16be(0) + u16be(params.size());
     let i = 0;
     while (i < params.size()) {
-        p = p + bt_typemap.bindValue(params.get(i) ?? db.dbNull());
+        p = p + typemap.bindValue(params.get(i) ?? db.dbNull());
         i = i + 1;
     }
     p = p + u16be(0);        // 0 result formats
@@ -148,7 +148,7 @@ pub fn decodeRowDesc(payload: string): List<Column> {
         c.skip(2);            // type_size
         c.skip(4);            // type_mod
         c.skip(2);            // format (text on the simple-query path)
-        cols.push(Column(name, bt_typemap.oidToDbType(oid)));
+        cols.push(Column(name, typemap.oidToDbType(oid)));
         i = i + 1;
     }
     return cols;
@@ -168,11 +168,11 @@ pub fn decodeDataRow(payload: string, cols: List<Column>): Row {
         // i32 -1 (when int arithmetic is 32-bit) or as 4294967295 (when 64-bit) — accept both,
         // so the NULL sentinel is detected regardless of int width.
         if (len == 4294967295 || len == -1) {
-            row.cells.push(bt_typemap.decodeCell(col.type_oid, "", true));
+            row.cells.push(typemap.decodeCell(col.type_oid, "", true));
         } else {
             let raw = string.slice(c.s, c.pos, c.pos + len);
             c.skip(len);
-            row.cells.push(bt_typemap.decodeCell(col.type_oid, raw, false));
+            row.cells.push(typemap.decodeCell(col.type_oid, raw, false));
         }
         i = i + 1;
     }

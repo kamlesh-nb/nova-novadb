@@ -1,16 +1,16 @@
-// btreedb.nova — the NovaDB driver SEAM: BTreeConnection (impl db.Connection) and
-// BTreeDriver (impl db.Driver) over the standardized binary wire protocol. This module
+// novadb.nova — the NovaDB driver SEAM: NovaConnection (impl db.Connection) and
+// NovaDriver (impl db.Driver) over the standardized binary wire protocol. This module
 // orchestrates the connection lifecycle + the request/response loops; every other
 // responsibility lives in its own module (SOLID/SRP):
 //
-//   bt_dsn      connection-string parsing        (BtDsn, parseDsn)
-//   bt_codec    the binary wire codec            (build* frames + decode* responses, stmtName)
-//   bt_typemap  OID<->DbType + value<->SQL/bind  (oidToDbType, decodeCell, substituteParams)
-//   bt_proto    async transport framing          (BtReader, BtFrame, readFrame, sendFrame)
+//   connection      connection-string parsing        (ConnectionOptions, parse)
+//   codec    the binary wire codec            (build* frames + decode* responses, stmtName)
+//   typemap  OID<->DbType + value<->SQL/bind  (oidToDbType, decodeCell, substituteParams)
+//   proto    async transport framing          (BtReader, BtFrame, readFrame, sendFrame)
 //
-// BTreeConnection/BTreeDriver are the only names consumers touch: `import btreedb; BTreeDriver()`.
+// NovaConnection/NovaDriver are the only names consumers touch: `import novadb; NovaDriver()`.
 //
-//   let drv = BTreeDriver();
+//   let drv = NovaDriver();
 //   let conn = drv.connect("127.0.0.1:3009");
 //   let rs = conn.query("SELECT id, name FROM users", List<DbValue>());
 //   let id = rs.row(0).getInt(0);   // typed, not a string
@@ -30,15 +30,15 @@ import bytes;
 import string;
 import list;
 import db;
-import bt_dsn;
-import bt_codec;
-import bt_typemap;
-import bt_proto;
+import connection;
+import codec;
+import typemap;
+import proto;
 
 // --- The seam implementation --------------------------------------------------
 
 /// A live NovaDB connection implementing the db.Connection seam.
-pub struct BTreeConnection impl Connection {
+pub struct NovaConnection impl Connection {
     pub io: aio.AsyncIO,
     pub reader: BtReader,
     pub prepared: List<string>,   // D6: emulated prepared-statement cache (client-side substitution)
@@ -60,20 +60,20 @@ pub struct BTreeConnection impl Connection {
     pub async fn query(self, sql: string, params: List<DbValue>): ResultSet {
         if (self.busy) { return db.errorResult(db.DbError("", "connection busy: concurrent use")); }
         self.busy = true;
-        let finalSql = bt_typemap.substituteParams(sql, params);
-        let sn = await bt_proto.sendFrame(self.io, bt_codec.buildQueryFrame(finalSql));
+        let finalSql = typemap.substituteParams(sql, params);
+        let sn = await proto.sendFrame(self.io, codec.buildQueryFrame(finalSql));
         let rs = ResultSet();
         while (true) {
-            let f = await bt_proto.readFrame(self.reader);
+            let f = await proto.readFrame(self.reader);
             if (f.ftype == -1) { break; }
             if (f.ftype == 90) { break; }                                   // 'Z' ReadyForQuery
-            if (f.ftype == 84) { rs.columns = bt_codec.decodeRowDesc(f.payload); }   // 'T'
-            if (f.ftype == 68) { rs.rows.push(bt_codec.decodeDataRow(f.payload, rs.columns)); } // 'D'
+            if (f.ftype == 84) { rs.columns = codec.decodeRowDesc(f.payload); }   // 'T'
+            if (f.ftype == 68) { rs.rows.push(codec.decodeDataRow(f.payload, rs.columns)); } // 'D'
             if (f.ftype == 67) {                                            // 'C'
-                rs.tag = bt_codec.decodeTag(f.payload);
-                rs.rows_affected = bt_codec.tagCount(rs.tag);
+                rs.tag = codec.decodeTag(f.payload);
+                rs.rows_affected = codec.tagCount(rs.tag);
             }
-            if (f.ftype == 69) { rs.err = bt_codec.decodeError(f.payload); }         // 'E' ErrorResponse
+            if (f.ftype == 69) { rs.err = codec.decodeError(f.payload); }         // 'E' ErrorResponse
         }
         self.busy = false;
         return rs;
@@ -82,20 +82,20 @@ pub struct BTreeConnection impl Connection {
     pub async fn exec(self, sql: string, params: List<DbValue>): ExecResult {
         if (self.busy) { return errorExec(db.DbError("", "connection busy: concurrent use")); }
         self.busy = true;
-        let finalSql = bt_typemap.substituteParams(sql, params);
-        let sn = await bt_proto.sendFrame(self.io, bt_codec.buildQueryFrame(finalSql));
+        let finalSql = typemap.substituteParams(sql, params);
+        let sn = await proto.sendFrame(self.io, codec.buildQueryFrame(finalSql));
         let tag = "";
         let err = noError();
         while (true) {
-            let f = await bt_proto.readFrame(self.reader);
+            let f = await proto.readFrame(self.reader);
             if (f.ftype == -1) { break; }
             if (f.ftype == 90) { break; }
-            if (f.ftype == 67) { tag = bt_codec.decodeTag(f.payload); }   // 'C'
-            if (f.ftype == 69) { err = bt_codec.decodeError(f.payload); }  // 'E' ErrorResponse
+            if (f.ftype == 67) { tag = codec.decodeTag(f.payload); }   // 'C'
+            if (f.ftype == 69) { err = codec.decodeError(f.payload); }  // 'E' ErrorResponse
         }
         self.busy = false;
         if (!err.isEmpty()) { return errorExec(err); }
-        return ExecResult(bt_codec.tagCount(tag), tag);
+        return ExecResult(codec.tagCount(tag), tag);
     }
 
     pub fn close(self): void {
@@ -130,22 +130,22 @@ pub struct BTreeConnection impl Connection {
         if (self.busy) { return db.errorResult(db.DbError("", "connection busy: concurrent use")); }
         self.busy = true;
         let sql = self.prepared.get(stmt) ?? "";
-        let name = bt_codec.stmtName(stmt);
-        let batch = bt_codec.buildParseFrame(name, sql, params) + bt_codec.buildBindFrame(name, name, params)
-            + bt_codec.buildExecuteFrame(name, 0) + bt_codec.buildSyncFrame();
-        let sn = await bt_proto.sendFrame(self.io, batch);
+        let name = codec.stmtName(stmt);
+        let batch = codec.buildParseFrame(name, sql, params) + codec.buildBindFrame(name, name, params)
+            + codec.buildExecuteFrame(name, 0) + codec.buildSyncFrame();
+        let sn = await proto.sendFrame(self.io, batch);
         let rs = ResultSet();
         while (true) {
-            let f = await bt_proto.readFrame(self.reader);
+            let f = await proto.readFrame(self.reader);
             if (f.ftype == -1) { break; }
             if (f.ftype == 90) { break; }                                   // 'Z' ReadyForQuery (from Sync)
-            if (f.ftype == 84) { rs.columns = bt_codec.decodeRowDesc(f.payload); }   // 'T' RowDescription
-            if (f.ftype == 68) { rs.rows.push(bt_codec.decodeDataRow(f.payload, rs.columns)); } // 'D' DataRow
+            if (f.ftype == 84) { rs.columns = codec.decodeRowDesc(f.payload); }   // 'T' RowDescription
+            if (f.ftype == 68) { rs.rows.push(codec.decodeDataRow(f.payload, rs.columns)); } // 'D' DataRow
             if (f.ftype == 67) {                                            // 'C' CommandComplete
-                rs.tag = bt_codec.decodeTag(f.payload);
-                rs.rows_affected = bt_codec.tagCount(rs.tag);
+                rs.tag = codec.decodeTag(f.payload);
+                rs.rows_affected = codec.tagCount(rs.tag);
             }
-            if (f.ftype == 69) { rs.err = bt_codec.decodeError(f.payload); }         // 'E' ErrorResponse
+            if (f.ftype == 69) { rs.err = codec.decodeError(f.payload); }         // 'E' ErrorResponse
             // '1' parse_complete (49), '2' bind_complete (50), 's' portal_suspended (115) are acks — ignore.
         }
         self.busy = false;
@@ -156,22 +156,22 @@ pub struct BTreeConnection impl Connection {
         if (self.busy) { return errorExec(db.DbError("", "connection busy: concurrent use")); }
         self.busy = true;
         let sql = self.prepared.get(stmt) ?? "";
-        let name = bt_codec.stmtName(stmt);
-        let batch = bt_codec.buildParseFrame(name, sql, params) + bt_codec.buildBindFrame(name, name, params)
-            + bt_codec.buildExecuteFrame(name, 0) + bt_codec.buildSyncFrame();
-        let sn = await bt_proto.sendFrame(self.io, batch);
+        let name = codec.stmtName(stmt);
+        let batch = codec.buildParseFrame(name, sql, params) + codec.buildBindFrame(name, name, params)
+            + codec.buildExecuteFrame(name, 0) + codec.buildSyncFrame();
+        let sn = await proto.sendFrame(self.io, batch);
         let tag = "";
         let err = noError();
         while (true) {
-            let f = await bt_proto.readFrame(self.reader);
+            let f = await proto.readFrame(self.reader);
             if (f.ftype == -1) { break; }
             if (f.ftype == 90) { break; }                          // 'Z' ReadyForQuery (from Sync)
-            if (f.ftype == 67) { tag = bt_codec.decodeTag(f.payload); }     // 'C' CommandComplete
-            if (f.ftype == 69) { err = bt_codec.decodeError(f.payload); }   // 'E' ErrorResponse
+            if (f.ftype == 67) { tag = codec.decodeTag(f.payload); }     // 'C' CommandComplete
+            if (f.ftype == 69) { err = codec.decodeError(f.payload); }   // 'E' ErrorResponse
         }
         self.busy = false;
         if (!err.isEmpty()) { return errorExec(err); }
-        return ExecResult(bt_codec.tagCount(tag), tag);
+        return ExecResult(codec.tagCount(tag), tag);
     }
 
     // Transaction control (standard SQL).
@@ -180,11 +180,11 @@ pub struct BTreeConnection impl Connection {
     pub async fn rollback(self): ExecResult { return await self.exec("ROLLBACK", List<DbValue>()); }
 }
 
-/// The NovaDB driver — `connect(dsn)` opens a connection. DSN is `host:port`.
+/// The NovaDB driver — `connect(connectionString)` opens a connection. connection string is `host:port`.
 // Whole connect + startup handshake as ONE async fn, driven once by the sync Driver.connect.
-// DSN parsing lives in bt_dsn (pure string work); this fn wires the parsed BtDsn to the socket/TLS.
-async fn btConnectAsync(dsn: string): BTreeConnection {
-    let d = bt_dsn.parseDsn(dsn);
+// connection string parsing lives in the connection module (pure string work); this fn wires the parsed ConnectionOptions to the socket/TLS.
+async fn btConnectAsync(connectionString: string): NovaConnection {
+    let d = connection.parse(connectionString);
 
     // NovaDB uses implicit TLS (the server serves TLS on the port when configured); tlsConnect[Verify]
     // is the whole client story. Both return an AsyncIO the connection holds transparently.
@@ -202,30 +202,30 @@ async fn btConnectAsync(dsn: string): BTreeConnection {
 }
 
 // Run startup over `io` (plaintext AsyncStream or TlsStream, both AsyncIO). Passing the concrete stream
-// into this AsyncIO param is a widening (the safe direction). The startup frame carries the DSN user +
-// database; if the server issues an AuthenticationCleartextPassword request ('R' method 3), the DSN
+// into this AsyncIO param is a widening (the safe direction). The startup frame carries the connection string user +
+// database; if the server issues an AuthenticationCleartextPassword request ('R' method 3), the connection string
 // password is sent back as a 'p' frame. NOTE: today's btree server (proto/session.zig) accepts startup
 // unconditionally — it replies AuthOk (method 0) without challenging — so the password path is dormant
 // but correct-by-construction for when the server enforces auth. SASL (method 10) is not yet supported.
-async fn btStartup(io: aio.AsyncIO, user: string, dbname: string, password: string): BTreeConnection {
+async fn btStartup(io: aio.AsyncIO, user: string, dbname: string, password: string): NovaConnection {
     let reader = BtReader(io);
-    let sn = await bt_proto.sendFrame(io, bt_codec.buildStartupFrame(user, dbname));
+    let sn = await proto.sendFrame(io, codec.buildStartupFrame(user, dbname));
     while (true) {
-        let f = await bt_proto.readFrame(reader);
+        let f = await proto.readFrame(reader);
         if (f.ftype == -1) { break; }
         if (f.ftype == 82) {                     // 'R' Authentication request
-            let method = bt_codec.authMethod(f.payload);
+            let method = codec.authMethod(f.payload);
             if (method == 3) {                   // AuthenticationCleartextPassword
-                let ps = await bt_proto.sendFrame(io, bt_codec.buildPasswordFrame(password));
+                let ps = await proto.sendFrame(io, codec.buildPasswordFrame(password));
             }
         }
         if (f.ftype == 90) { break; }            // 'Z' ReadyForQuery
     }
-    return BTreeConnection(io, reader);
+    return NovaConnection(io, reader);
 }
 
-pub struct BTreeDriver impl Driver {
-    pub async fn connect(self, dsn: string): Connection {
-        return await btConnectAsync(dsn);   // sync trait method drives the async connect once
+pub struct NovaDriver impl Driver {
+    pub async fn connect(self, connectionString: string): Connection {
+        return await btConnectAsync(connectionString);   // sync trait method drives the async connect once
     }
 }

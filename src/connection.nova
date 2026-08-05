@@ -1,10 +1,10 @@
-// bt_dsn — NovaDB connection-string parsing (SRP: DSN only).
-// `btreedb://user[:password]@host[:port]/... ?db=..&tls=..&tlsCAFile=..`  (host:port is the
+// connection: NovaDB connection-string parsing (SRP: connection string only).
+// `novadb://user[:password]@host[:port]/... ?db=..&tls=..&tlsCAFile=..`  (host:port is the
 // minimal form; the query params + `user:pass@` userinfo supply the rest). Pure string work;
-// no I/O, no db seam. The seam (btreedb.nova) turns a BtDsn into a live connection.
+// no I/O, no db seam. The seam (novadb.nova) turns a ConnectionOptions into a live connection.
 import string;
 
-pub struct BtDsn {
+pub struct ConnectionOptions {
     pub host: string,
     pub port: int,
     pub user: string,
@@ -20,35 +20,35 @@ pub struct BtDsn {
     }
 }
 
-// Pull `key=value` out of a `?a=b&c=d` DSN query string (returns `dflt` if absent).
-fn dsnParam(dsn: string, key: string, dflt: string): string {
+// Pull `key=value` out of a `?a=b&c=d` connection string query string (returns `dflt` if absent).
+fn queryParam(connectionString: string, key: string, dflt: string): string {
     let needle = key + "=";
-    let idx = string.indexOf(dsn, needle);
+    let idx = string.indexOf(connectionString, needle);
     if (idx == -1) { return dflt; }
-    let rest = string.slice(dsn, idx + needle.length, dsn.length);
+    let rest = string.slice(connectionString, idx + needle.length, connectionString.length);
     let amp = string.indexOf(rest, "&");
     if (amp == -1) { return rest; }
     return string.slice(rest, 0, amp);
 }
 
-// Parse the DSN into its parts. DSN is `host:port` with optional `user:pass@` userinfo prefix and
+// Parse the connection string into its parts. connection string is `host:port` with optional `user:pass@` userinfo prefix and
 // `?db=..&tls=..&tlsCAFile=..` query params.
-pub fn parseDsn(dsn: string): BtDsn {
-    let tlsOpt = dsnParam(dsn, "tls", "false");
+pub fn parse(connectionString: string): ConnectionOptions {
+    let tlsOpt = queryParam(connectionString, "tls", "false");
     let useTls = string.eql(tlsOpt, "true") || string.eql(tlsOpt, "verify");
     let verify = string.eql(tlsOpt, "verify");
-    let caFile = dsnParam(dsn, "tlsCAFile", "");
+    let caFile = queryParam(connectionString, "tlsCAFile", "");
 
-    let base = dsn;
+    let base = connectionString;
     let qq = string.indexOf(base, "?");
     if (qq != -1) { base = string.slice(base, 0, qq); }
 
-    // Credentials from the DSN. `user=`/`password=`/`db=` query params provide defaults; a
+    // Credentials from the connection string. `user=`/`password=`/`db=` query params provide defaults; a
     // `user:pass@host:port` userinfo prefix (if present) overrides user/password. Real creds now
     // flow into the startup + auth handshake instead of the previously hardcoded "admin"/"nova".
-    let user = dsnParam(dsn, "user", "admin");
-    let password = dsnParam(dsn, "password", "");
-    let dbname = dsnParam(dsn, "db", "nova");
+    let user = queryParam(connectionString, "user", "admin");
+    let password = queryParam(connectionString, "password", "");
+    let dbname = queryParam(connectionString, "db", "nova");
     let at = string.indexOf(base, "@");
     if (at != -1) {
         let userinfo = string.slice(base, 0, at);
@@ -66,5 +66,5 @@ pub fn parseDsn(dsn: string): BtDsn {
     let host = colon == -1 ? base : string.slice(base, 0, colon);
     let port = colon == -1 ? 3009 : string.parseI64(string.slice(base, colon + 1, base.length));
 
-    return BtDsn(host, port, user, password, dbname, useTls, verify, caFile);
+    return ConnectionOptions(host, port, user, password, dbname, useTls, verify, caFile);
 }

@@ -1,8 +1,8 @@
-// bt_proto — the async transport framing (SRP: read/write whole protocol frames off a
+// proto — the async transport framing (SRP: read/write whole protocol frames off a
 // live stream). Buffered reader over an AsyncIO; the socket I/O is non-blocking — `fill`
 // awaits `io.recvInto`, which PARKS the coroutine (asio arecv) instead of blocking the
 // scheduler thread. `io` is an AsyncStream; a TLS variant (TlsStream) drops in unchanged
-// via the shared recvInto shape. Knows framing bytes only — payload MEANING lives in bt_codec.
+// via the shared recvInto shape. Knows framing bytes only — payload MEANING lives in codec.
 import net.aio;
 import bytes;
 

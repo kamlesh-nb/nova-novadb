@@ -7,17 +7,17 @@ nova get https://github.com/kamlesh-nb/nova-novadb
 ```
 
 ```nova
-import btreedb;
+import novadb;
 ```
 
 ## Structure (SOLID)
 
-Split by responsibility; consumers only touch the seam (`BTreeDriver` / `BTreeConnection`).
+Split by responsibility; consumers only touch the seam (`NovaDriver` / `NovaConnection`).
 
 | Module       | Responsibility |
 |--------------|----------------|
-| `btreedb`    | Seam: `BTreeConnection impl Connection` + `BTreeDriver impl Driver` + connect/startup. |
-| `bt_dsn`     | Connection-string parsing (`BtDsn`, `parseDsn`). |
-| `bt_codec`   | Wire codec — frame builders + response decoders + `BtCursor`. |
-| `bt_typemap` | OID↔`DbType`, `DbValue`→SQL/bind text, `substituteParams`. |
-| `bt_proto`   | Async transport framing (`BtReader`, `BtFrame`, `readFrame`, `sendFrame`). |
+| `novadb`    | Seam: `NovaConnection impl Connection` + `NovaDriver impl Driver` + connect/startup. |
+| `connection`     | Connection-string parsing (`ConnectionOptions`, `parse`). |
+| `codec`   | Wire codec — frame builders + response decoders + `BtCursor`. |
+| `typemap` | OID↔`DbType`, `DbValue`→SQL/bind text, `substituteParams`. |
+| `proto`   | Async transport framing (`BtReader`, `BtFrame`, `readFrame`, `sendFrame`). |
