@@ -42,7 +42,7 @@ async fn fill(r: BtReader): bool {
         r.pos = 0;
     }
     let space = r.cap - r.len;
-    let n = await r.io.recvInto((r.buf + r.len) as int, space);   // parks the coroutine
+    let n = await r.io.recvInto((r.buf as long) + (r.len as long), space);   // parks the coroutine
     if (n <= 0) { return false; }
     r.len = r.len + n;
     return true;
