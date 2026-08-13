@@ -79,6 +79,14 @@ pub struct NovaConnection impl Connection {
         return rs;
     }
 
+    // T1: satisfy the Connection seam's queryWire via the generic re-encode fallback. This driver's simple-
+    // query path already materialises a ResultSet, so we re-encode it into WireRows' canonical layout; a
+    // zero-materialisation override (like pg/mysql's direct text path) can come later if it shows up in a
+    // profile. Without this the driver does not satisfy the trait and any app importing it fails to build.
+    pub async fn queryWire(self, sql: string, params: List<DbValue>): WireRows {
+        return db.wireRowsFromResultSet(await self.query(sql, params));
+    }
+
     pub async fn exec(self, sql: string, params: List<DbValue>): ExecResult {
         if (self.busy) { return errorExec(db.DbError("", "connection busy: concurrent use")); }
         self.busy = true;
