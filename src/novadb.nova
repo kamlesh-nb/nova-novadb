@@ -37,6 +37,13 @@ import proto;
 
 // --- The seam implementation --------------------------------------------------
 
+// The DbError raised when a request cannot reach the server or the response ends
+// before ReadyForQuery: a send that returned < 0, or a read that hit EOF / a short
+// read / a corrupt frame length. SQLSTATE 08006 is connection_failure. Callers check
+// `.hasError()` / `err.code == "08006"` to tell a dead connection apart from an
+// ordinary empty result, which they otherwise look identical to.
+fn connLost(): DbError { return db.DbError("08006", "connection to NovaDB lost"); }
+
 /// A live NovaDB connection implementing the db.Connection seam.
 pub struct NovaConnection impl Connection {
     pub io: aio.AsyncIO,
@@ -62,10 +69,15 @@ pub struct NovaConnection impl Connection {
         self.busy = true;
         let finalSql = typemap.substituteParams(sql, params);
         let sn = await proto.sendFrame(self.io, codec.buildQueryFrame(finalSql));
+        if (sn < 0) { self.busy = false; return db.errorResult(connLost()); }
         let rs = ResultSet();
         while (true) {
             let f = await proto.readFrame(self.reader);
-            if (f.ftype == -1) { break; }
+            // A -1 frame is a DIRTY end (EOF / short read / corrupt length) before the
+            // server's ReadyForQuery ('Z', 90). Distinguish it from a clean completion:
+            // flag the transport loss so callers see .hasError() rather than a silent
+            // empty-but-ok result (which reads exactly like "no rows").
+            if (f.ftype == -1) { if (rs.err.isEmpty()) { rs.err = connLost(); } break; }
             if (f.ftype == 90) { break; }                                   // 'Z' ReadyForQuery
             if (f.ftype == 84) { rs.columns = codec.decodeRowDesc(f.payload); }   // 'T'
             if (f.ftype == 68) { rs.rows.push(codec.decodeDataRow(f.payload, rs.columns)); } // 'D'
@@ -92,11 +104,12 @@ pub struct NovaConnection impl Connection {
         self.busy = true;
         let finalSql = typemap.substituteParams(sql, params);
         let sn = await proto.sendFrame(self.io, codec.buildQueryFrame(finalSql));
+        if (sn < 0) { self.busy = false; return errorExec(connLost()); }
         let tag = "";
         let err = noError();
         while (true) {
             let f = await proto.readFrame(self.reader);
-            if (f.ftype == -1) { break; }
+            if (f.ftype == -1) { if (err.isEmpty()) { err = connLost(); } break; }
             if (f.ftype == 90) { break; }
             if (f.ftype == 67) { tag = codec.decodeTag(f.payload); }   // 'C'
             if (f.ftype == 69) { err = codec.decodeError(f.payload); }  // 'E' ErrorResponse
@@ -142,10 +155,11 @@ pub struct NovaConnection impl Connection {
         let batch = codec.buildParseFrame(name, sql, params) + codec.buildBindFrame(name, name, params)
             + codec.buildExecuteFrame(name, 0) + codec.buildSyncFrame();
         let sn = await proto.sendFrame(self.io, batch);
+        if (sn < 0) { self.busy = false; return db.errorResult(connLost()); }
         let rs = ResultSet();
         while (true) {
             let f = await proto.readFrame(self.reader);
-            if (f.ftype == -1) { break; }
+            if (f.ftype == -1) { if (rs.err.isEmpty()) { rs.err = connLost(); } break; }
             if (f.ftype == 90) { break; }                                   // 'Z' ReadyForQuery (from Sync)
             if (f.ftype == 84) { rs.columns = codec.decodeRowDesc(f.payload); }   // 'T' RowDescription
             if (f.ftype == 68) { rs.rows.push(codec.decodeDataRow(f.payload, rs.columns)); } // 'D' DataRow
@@ -168,11 +182,12 @@ pub struct NovaConnection impl Connection {
         let batch = codec.buildParseFrame(name, sql, params) + codec.buildBindFrame(name, name, params)
             + codec.buildExecuteFrame(name, 0) + codec.buildSyncFrame();
         let sn = await proto.sendFrame(self.io, batch);
+        if (sn < 0) { self.busy = false; return errorExec(connLost()); }
         let tag = "";
         let err = noError();
         while (true) {
             let f = await proto.readFrame(self.reader);
-            if (f.ftype == -1) { break; }
+            if (f.ftype == -1) { if (err.isEmpty()) { err = connLost(); } break; }
             if (f.ftype == 90) { break; }                          // 'Z' ReadyForQuery (from Sync)
             if (f.ftype == 67) { tag = codec.decodeTag(f.payload); }     // 'C' CommandComplete
             if (f.ftype == 69) { err = codec.decodeError(f.payload); }   // 'E' ErrorResponse
