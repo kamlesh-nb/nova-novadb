@@ -1,0 +1,96 @@
+// The NovaDB driver's DOCUMENT-model wire codec (src/codec.nova) — gated OFFLINE
+// against hand-built byte buffers matching the server's 'J' doc opcode
+// (btree proto/wire.zig `Frontend.doc_op` + `encodeDocResult`). Verifies the
+// request-frame encoding (insert/find/find_one/create_collection) and the
+// document-result ('j') decode, without a live server.
+import assert;
+import bytes;
+import string;
+import list;
+import codec;
+
+fn byte1(b: int): string {
+    let p = bytes.alloc(1);
+    bytes.write_byte(p, 0, b);
+    return p as string;
+}
+fn u16b(v: int): string {
+    let p = bytes.alloc(2);
+    bytes.write_byte(p, 0, (v / 256) % 256);
+    bytes.write_byte(p, 1, v % 256);
+    return p as string;
+}
+fn u32b(v: int): string {
+    let p = bytes.alloc(4);
+    bytes.write_byte(p, 0, (v / 16777216) % 256);
+    bytes.write_byte(p, 1, (v / 65536) % 256);
+    bytes.write_byte(p, 2, (v / 256) % 256);
+    bytes.write_byte(p, 3, v % 256);
+    return p as string;
+}
+fn s16(s: string): string { return u16b(s.length) + s; }
+
+@test
+fn test_doc_request_frame_encoding(): void {
+    // Insert frame 'J' (74): payload = [u8 op=1][u16 coll]["products"][bson].
+    let bson = "BSONBYTES";
+    let f = codec.buildDocInsertFrame("products", bson);
+    assert.equalInt(f[0], 74);                       // 'J'
+    let expectPayload = byte1(1) + s16("products") + bson;
+    // Framed = [74][u32 len = 4 + payloadLen][payload].
+    assert.equalInt(f.length, 5 + expectPayload.length);
+    let plen = 4 + expectPayload.length;
+    assert.equalInt(f[1], (plen / 16777216) % 256);
+    assert.equalInt(f[2], (plen / 65536) % 256);
+    assert.equalInt(f[3], (plen / 256) % 256);
+    assert.equalInt(f[4], plen % 256);
+    assert.equalStr(string.slice(f, 5, f.length), expectPayload);
+}
+
+@test
+fn test_doc_ops_carry_the_right_opcode(): void {
+    // Byte 5 of the frame (first payload byte) is the op code.
+    let ins = codec.buildDocInsertFrame("c", "x");
+    let fnd = codec.buildDocFindFrame("c", "x");
+    let one = codec.buildDocFindOneFrame("c", "x");
+    let crt = codec.buildDocCreateCollectionFrame("c");
+    assert.equalInt(ins[5], 1);   // insert
+    assert.equalInt(fnd[5], 2);   // find
+    assert.equalInt(one[5], 3);   // find_one
+    assert.equalInt(crt[5], 4);   // create_collection
+
+    // create_collection carries no BSON payload: [op=4][s16("c")] only.
+    let expectCrt = byte1(4) + s16("c");
+    assert.equalStr(string.slice(crt, 5, crt.length), expectCrt);
+}
+
+@test
+fn test_decode_doc_result(): void {
+    // 'j' result payload: count(u32) then per doc {len(u32), bytes}.
+    let payload = u32b(3) + u32b(3) + "aaa" + u32b(2) + "bb" + u32b(4) + "cccc";
+    let docs = codec.decodeDocResult(payload);
+    assert.equalInt(docs.size(), 3);
+    assert.equalStr(docs.get(0) ?? "", "aaa");
+    assert.equalStr(docs.get(1) ?? "", "bb");
+    assert.equalStr(docs.get(2) ?? "", "cccc");
+
+    // An empty result set (count 0) decodes to no documents.
+    let empty = codec.decodeDocResult(u32b(0));
+    assert.equalInt(empty.size(), 0);
+}
+
+@test
+fn test_doc_result_binary_safe(): void {
+    // Documents contain embedded NULs (real BSON does); the byte-string slicing must
+    // preserve them exactly.
+    let doc0 = byte1(0) + "A" + byte1(0) + "B";   // 4 bytes with two NULs
+    let payload = u32b(1) + u32b(4) + doc0;
+    let docs = codec.decodeDocResult(payload);
+    assert.equalInt(docs.size(), 1);
+    let got = docs.get(0) ?? "";
+    assert.equalInt(got.length, 4);
+    assert.equalInt(got[0], 0);
+    assert.equalInt(got[1], 65);   // 'A'
+    assert.equalInt(got[2], 0);
+    assert.equalInt(got[3], 66);   // 'B'
+}

@@ -1,0 +1,25 @@
+// Compile-and-shape check for the document seam in src/novadb.nova. Importing
+// `novadb` forces the whole NovaConnection (including the new createCollection/
+// insertDoc/findDocs/findOneDoc methods) to typecheck offline; the async request
+// methods themselves need a live server, so here we only exercise the DocResult
+// value type they return.
+import assert;
+import list;
+import db;
+import novadb;
+
+@test
+fn test_doc_result_shape(): void {
+    let docs = List<string>();
+    docs.push("doc-one");
+    docs.push("doc-two");
+    let ok = DocResult(docs, db.DbError("", ""));
+    assert.isTrue(!ok.hasError());
+    assert.equalInt(ok.size(), 2);
+    assert.equalStr(ok.docs.get(0) ?? "", "doc-one");
+
+    let bad = DocResult(List<string>(), db.DbError("08006", "connection to NovaDB lost"));
+    assert.isTrue(bad.hasError());
+    assert.equalInt(bad.size(), 0);
+    assert.equalStr(bad.err.code, "08006");
+}

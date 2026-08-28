@@ -201,6 +201,85 @@ pub struct NovaConnection impl Connection {
     pub async fn begin(self): ExecResult { return await self.exec("BEGIN", List<DbValue>()); }
     pub async fn commit(self): ExecResult { return await self.exec("COMMIT", List<DbValue>()); }
     pub async fn rollback(self): ExecResult { return await self.exec("ROLLBACK", List<DbValue>()); }
+
+    // --- Document model (NovaDB 'J' doc opcode) -------------------------------
+    // NovaDB-specific methods (not part of the generic SQL Connection seam). They
+    // exchange raw BSON byte-strings: the app builds a document/filter with
+    // std/serde/bson and parses the returned documents the same way. Each takes the
+    // `busy` guard like query/exec — one in-flight request per connection.
+
+    /// Create a collection if it does not already exist (idempotent server-side).
+    pub async fn createCollection(self, name: string): ExecResult {
+        return await self.docExec(codec.buildDocCreateCollectionFrame(name));
+    }
+    /// Insert one BSON document (which must carry an `_id`) into `collection`.
+    pub async fn insertDoc(self, collection: string, bson: string): ExecResult {
+        return await self.docExec(codec.buildDocInsertFrame(collection, bson));
+    }
+    /// Return every document in `collection` matching the BSON `filter` (`{}` = all).
+    pub async fn findDocs(self, collection: string, filter: string): DocResult {
+        return await self.docQuery(codec.buildDocFindFrame(collection, filter));
+    }
+    /// Return the first document matching the BSON `filter` (zero or one document).
+    pub async fn findOneDoc(self, collection: string, filter: string): DocResult {
+        return await self.docQuery(codec.buildDocFindOneFrame(collection, filter));
+    }
+
+    // Send a write-style doc frame (create/insert) and drain to ReadyForQuery,
+    // returning the command tag or the server error.
+    async fn docExec(self, frame: string): ExecResult {
+        if (self.busy) { return errorExec(db.DbError("", "connection busy: concurrent use")); }
+        self.busy = true;
+        let sn = await proto.sendFrame(self.io, frame);
+        if (sn < 0) { self.busy = false; return errorExec(connLost()); }
+        let tag = "";
+        let err = noError();
+        while (true) {
+            let f = await proto.readFrame(self.reader);
+            if (f.ftype == -1) { if (err.isEmpty()) { err = connLost(); } break; }
+            if (f.ftype == 90) { break; }                                // 'Z' ReadyForQuery
+            if (f.ftype == 67) { tag = codec.decodeTag(f.payload); }     // 'C' CommandComplete
+            if (f.ftype == 69) { err = codec.decodeError(f.payload); }   // 'E' ErrorResponse
+        }
+        self.busy = false;
+        if (!err.isEmpty()) { return errorExec(err); }
+        return ExecResult(codec.tagCount(tag), tag);
+    }
+
+    // Send a read-style doc frame (find/find_one) and collect the doc-result ('j')
+    // frames into a DocResult.
+    async fn docQuery(self, frame: string): DocResult {
+        if (self.busy) { return DocResult(List<string>(), db.DbError("", "connection busy: concurrent use")); }
+        self.busy = true;
+        let sn = await proto.sendFrame(self.io, frame);
+        if (sn < 0) { self.busy = false; return DocResult(List<string>(), connLost()); }
+        let docs = List<string>();
+        let err = noError();
+        while (true) {
+            let f = await proto.readFrame(self.reader);
+            if (f.ftype == -1) { if (err.isEmpty()) { err = connLost(); } break; }
+            if (f.ftype == 90) { break; }                                // 'Z' ReadyForQuery
+            if (f.ftype == 106) {                                        // 'j' document result
+                let part = codec.decodeDocResult(f.payload);
+                let i = 0;
+                while (i < part.size()) { docs.push(part.get(i) ?? ""); i = i + 1; }
+            }
+            if (f.ftype == 69) { err = codec.decodeError(f.payload); }   // 'E' ErrorResponse
+        }
+        self.busy = false;
+        return DocResult(docs, err);
+    }
+}
+
+/// A document query result: the matched BSON documents (each a raw byte-string) plus
+/// any server error. Mirrors ResultSet for the document path; the app parses each
+/// document with std/serde/bson.
+pub struct DocResult {
+    pub docs: List<string>,
+    pub err: DbError,
+    init(docs: List<string>, err: DbError) { self.docs = docs; self.err = err; }
+    pub fn hasError(self): bool { return !self.err.isEmpty(); }
+    pub fn size(self): int { return self.docs.size(); }
 }
 
 /// The NovaDB driver — `connect(connectionString)` opens a connection. connection string is `host:port`.

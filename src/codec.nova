@@ -94,6 +94,42 @@ pub fn buildExecuteFrame(portal: string, maxRows: int): string {
 /// Sync ('S'): empty payload; the server replies ReadyForQuery ('Z').
 pub fn buildSyncFrame(): string { return frameOf(83, ""); }   // 'S'
 
+// --- Document model: the 'J' doc opcode (NovaDB extension) --------------------
+// NovaDB carries document (BSON) operations over the SAME negotiated connection via
+// a 'J' (74) frontend frame the server (btree proto/wire.zig `Frontend.doc_op`)
+// recognises. 'J' is NOT a PostgreSQL frontend byte, so it never collides. Payload:
+// [u8 op][u16-prefixed collection][BSON payload]. op: 1=insert, 2=find, 3=find_one,
+// 4=create_collection. The BSON `payload` is a document for insert, a filter for
+// find/find_one, and empty for create_collection.
+
+/// Build a document request frame. `payload` is raw BSON bytes (a document or a
+/// filter), or "" for create_collection.
+pub fn buildDocRequestFrame(op: int, collection: string, payload: string): string {
+    return frameOf(74, byte1(op) + wstr16(collection) + payload);   // 'J'
+}
+pub fn buildDocCreateCollectionFrame(name: string): string { return buildDocRequestFrame(4, name, ""); }
+pub fn buildDocInsertFrame(collection: string, bson: string): string { return buildDocRequestFrame(1, collection, bson); }
+pub fn buildDocFindFrame(collection: string, filter: string): string { return buildDocRequestFrame(2, collection, filter); }
+pub fn buildDocFindOneFrame(collection: string, filter: string): string { return buildDocRequestFrame(3, collection, filter); }
+
+/// Decode a document result ('j', 106) payload into the list of matched BSON
+/// documents (each a raw byte-string). Layout: count(u32) then, per document, a
+/// length(u32, always >= 0 here) and its bytes.
+pub fn decodeDocResult(payload: string): List<string> {
+    let docs = List<string>();
+    let c = BtCursor(payload);
+    let n = c.uint();
+    let i = 0;
+    while (i < n) {
+        let len = c.uint();
+        let raw = string.slice(c.s, c.pos, c.pos + len);
+        c.skip(len);
+        docs.push(raw);
+        i = i + 1;
+    }
+    return docs;
+}
+
 // A per-handle statement/portal name. The server replaces a same-named prepared statement on re-Parse,
 // so reusing the name across calls of the same handle is safe (and cheap).
 pub fn stmtName(handle: int): string { return `s${handle}`; }
