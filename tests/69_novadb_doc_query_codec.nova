@@ -51,6 +51,18 @@ fn test_write_ops_carry_the_right_opcode(): void {
     assert.equalInt(codec.buildDocUpsertFrame("c", "f", "s")[5], 15);
     assert.equalInt(codec.buildDocBulkWriteFrame("c", "x")[5], 16);
     assert.equalInt(codec.buildDocAggregateFrame("c", "x")[5], 17);
+    assert.equalInt(codec.buildDocInsertUniqueFrame("c", "x")[5], 18);
+    assert.equalInt(codec.buildDocStatsFrame("c")[5], 19);
+    assert.equalInt(codec.buildDocCreateUniqueIndexFrame("c", "p")[5], 20);
+}
+
+@test
+fn test_parse_inserted_id(): void {
+    // "INSERT-DOC 1 <24 hex>" -> the trailing 24 chars.
+    let hex = "0123456789abcdef01234567";
+    assert.equalStr(codec.parseInsertedId("INSERT-DOC 1 " + hex), hex);
+    // No id present -> "".
+    assert.equalStr(codec.parseInsertedId("INSERT-DOC 1"), "");
 }
 
 @test

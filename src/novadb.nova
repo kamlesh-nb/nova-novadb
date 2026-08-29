@@ -217,6 +217,17 @@ pub struct NovaConnection impl Connection {
     pub async fn insertDoc(self, collection: string, bson: string): ExecResult {
         return await self.docExec(codec.buildDocInsertFrame(collection, bson));
     }
+    /// Insert-if-absent: insert one document, failing with a 23505 duplicate-key
+    /// error if a document with the same `_id` already exists (the server also
+    /// generates an `_id` when absent, in which case a collision is impossible).
+    pub async fn insertUniqueDoc(self, collection: string, bson: string): ExecResult {
+        return await self.docExec(codec.buildDocInsertUniqueFrame(collection, bson));
+    }
+    /// Read the document-path observability counters. The single returned BSON
+    /// document is `{finds, inserts, deletes, updates, docsScanned, docsMatched}`.
+    pub async fn docStats(self, collection: string): DocResult {
+        return await self.docQuery(codec.buildDocStatsFrame(collection));
+    }
     /// Insert many documents in one round trip. `docsEnvelope` is a BSON document
     /// with a `docs` array field; the server generates an `_id` for any element
     /// that lacks one.
@@ -226,6 +237,11 @@ pub struct NovaConnection impl Connection {
     /// Create a secondary index on `path` (a plain or dotted field path).
     pub async fn createIndex(self, collection: string, path: string): ExecResult {
         return await self.docExec(codec.buildDocCreateIndexFrame(collection, path));
+    }
+    /// Create a UNIQUE index on `path`: a write giving a second document the same
+    /// value then fails with a 23505 duplicate-key error.
+    pub async fn createUniqueIndex(self, collection: string, path: string): ExecResult {
+        return await self.docExec(codec.buildDocCreateUniqueIndexFrame(collection, path));
     }
     /// Update every document matching the BSON `filter` with the update `spec`
     /// (`$set`/`$unset`/`$inc`). Returns the count in the command tag.

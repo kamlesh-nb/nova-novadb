@@ -112,6 +112,8 @@ pub fn buildDocInsertFrame(collection: string, bson: string): string { return bu
 pub fn buildDocFindFrame(collection: string, filter: string): string { return buildDocRequestFrame(2, collection, filter); }
 pub fn buildDocFindOneFrame(collection: string, filter: string): string { return buildDocRequestFrame(3, collection, filter); }
 pub fn buildDocCreateIndexFrame(collection: string, path: string): string { return buildDocRequestFrame(10, collection, path); }
+// create_unique_index (op 20): payload is the field path; enforces uniqueness.
+pub fn buildDocCreateUniqueIndexFrame(collection: string, path: string): string { return buildDocRequestFrame(20, collection, path); }
 // find_query (op 11): payload is a BSON envelope {filter, projection, sort, skip, limit}.
 pub fn buildDocFindQueryFrame(collection: string, envelope: string): string { return buildDocRequestFrame(11, collection, envelope); }
 // count (op 12): payload is the BSON filter; result is a one-doc set {n: <count>}.
@@ -132,6 +134,21 @@ pub fn buildDocUpsertFrame(collection: string, filter: string, spec: string): st
 pub fn buildDocBulkWriteFrame(collection: string, opsEnvelope: string): string { return buildDocRequestFrame(16, collection, opsEnvelope); }
 // aggregate (op 17): payload is a BSON document {stages: [ ... ]}.
 pub fn buildDocAggregateFrame(collection: string, pipeline: string): string { return buildDocRequestFrame(17, collection, pipeline); }
+// insert_unique (op 18): payload is the BSON document; fails on a duplicate _id.
+pub fn buildDocInsertUniqueFrame(collection: string, bson: string): string { return buildDocRequestFrame(18, collection, bson); }
+// doc_stats (op 19): payload ignored; returns one doc of counters.
+pub fn buildDocStatsFrame(collection: string): string { return buildDocRequestFrame(19, collection, ""); }
+
+/// Extract the 24-char hex `_id` the server returns in an insert command tag
+/// ("INSERT-DOC 1 <hex>"), or "" when the tag carries no id. The app can turn
+/// the hex back into a 12-byte ObjectId when it needs the raw bytes.
+pub fn parseInsertedId(tag: string): string {
+    // Tag is "INSERT-DOC 1 <24-hex>"; the id, when present, is the trailing 24
+    // characters preceded by a space.
+    if (tag.length < 25) { return ""; }
+    if (tag[tag.length - 25] != 32) { return ""; }   // 32 = ' '
+    return string.slice(tag, tag.length - 24, tag.length);
+}
 
 /// Decode a document result ('j', 106) payload into the list of matched BSON
 /// documents (each a raw byte-string). Layout: count(u32) then, per document, a
