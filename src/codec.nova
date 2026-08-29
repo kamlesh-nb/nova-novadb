@@ -111,6 +111,27 @@ pub fn buildDocCreateCollectionFrame(name: string): string { return buildDocRequ
 pub fn buildDocInsertFrame(collection: string, bson: string): string { return buildDocRequestFrame(1, collection, bson); }
 pub fn buildDocFindFrame(collection: string, filter: string): string { return buildDocRequestFrame(2, collection, filter); }
 pub fn buildDocFindOneFrame(collection: string, filter: string): string { return buildDocRequestFrame(3, collection, filter); }
+pub fn buildDocCreateIndexFrame(collection: string, path: string): string { return buildDocRequestFrame(10, collection, path); }
+// find_query (op 11): payload is a BSON envelope {filter, projection, sort, skip, limit}.
+pub fn buildDocFindQueryFrame(collection: string, envelope: string): string { return buildDocRequestFrame(11, collection, envelope); }
+// count (op 12): payload is the BSON filter; result is a one-doc set {n: <count>}.
+pub fn buildDocCountFrame(collection: string, filter: string): string { return buildDocRequestFrame(12, collection, filter); }
+// insert_many (op 13): payload is a BSON document with a `docs` array field.
+pub fn buildDocInsertManyFrame(collection: string, docsEnvelope: string): string { return buildDocRequestFrame(13, collection, docsEnvelope); }
+// find_cursor (op 14): payload is a BSON envelope {filter, after, batch}.
+pub fn buildDocFindCursorFrame(collection: string, envelope: string): string { return buildDocRequestFrame(14, collection, envelope); }
+// The update/upsert payload: u32(big-endian) filter length, then filter, then spec.
+pub fn buildUpdatePayload(filter: string, spec: string): string { return u32be(filter.length) + filter + spec; }
+// delete (op 8): payload is the BSON filter.
+pub fn buildDocDeleteFrame(collection: string, filter: string): string { return buildDocRequestFrame(8, collection, filter); }
+// update (op 9): payload is buildUpdatePayload(filter, spec).
+pub fn buildDocUpdateFrame(collection: string, filter: string, spec: string): string { return buildDocRequestFrame(9, collection, buildUpdatePayload(filter, spec)); }
+// upsert (op 15): same payload shape as update; inserts when no document matches.
+pub fn buildDocUpsertFrame(collection: string, filter: string, spec: string): string { return buildDocRequestFrame(15, collection, buildUpdatePayload(filter, spec)); }
+// bulk_write (op 16): payload is a BSON document with an `ops` array.
+pub fn buildDocBulkWriteFrame(collection: string, opsEnvelope: string): string { return buildDocRequestFrame(16, collection, opsEnvelope); }
+// aggregate (op 17): payload is a BSON document {stages: [ ... ]}.
+pub fn buildDocAggregateFrame(collection: string, pipeline: string): string { return buildDocRequestFrame(17, collection, pipeline); }
 
 /// Decode a document result ('j', 106) payload into the list of matched BSON
 /// documents (each a raw byte-string). Layout: count(u32) then, per document, a
@@ -128,6 +149,37 @@ pub fn decodeDocResult(payload: string): List<string> {
         i = i + 1;
     }
     return docs;
+}
+
+/// A decoded cursor page: the documents plus the optional 12-byte resume id
+/// (empty string when the collection is exhausted).
+pub struct DocCursorPage {
+    pub docs: List<string>,
+    pub next: string,
+    init(docs: List<string>, next: string) { self.docs = docs; self.next = next; }
+}
+
+/// Decode a cursor result ('j') produced by the server's `find_cursor`. Layout:
+/// [u8 has_next][12 bytes next, if has_next][u32 count][per doc: u32 len + bytes].
+pub fn decodeDocCursorResult(payload: string): DocCursorPage {
+    let c = BtCursor(payload);
+    let hasNext = c.byte();
+    let next = "";
+    if (hasNext != 0) {
+        next = string.slice(c.s, c.pos, c.pos + 12);
+        c.skip(12);
+    }
+    let docs = List<string>();
+    let n = c.uint();
+    let i = 0;
+    while (i < n) {
+        let len = c.uint();
+        let raw = string.slice(c.s, c.pos, c.pos + len);
+        c.skip(len);
+        docs.push(raw);
+        i = i + 1;
+    }
+    return DocCursorPage(docs, next);
 }
 
 // A per-handle statement/portal name. The server replaces a same-named prepared statement on re-Parse,

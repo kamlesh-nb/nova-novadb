@@ -212,9 +212,40 @@ pub struct NovaConnection impl Connection {
     pub async fn createCollection(self, name: string): ExecResult {
         return await self.docExec(codec.buildDocCreateCollectionFrame(name));
     }
-    /// Insert one BSON document (which must carry an `_id`) into `collection`.
+    /// Insert one BSON document into `collection`. If the document has no `_id`
+    /// the server generates one.
     pub async fn insertDoc(self, collection: string, bson: string): ExecResult {
         return await self.docExec(codec.buildDocInsertFrame(collection, bson));
+    }
+    /// Insert many documents in one round trip. `docsEnvelope` is a BSON document
+    /// with a `docs` array field; the server generates an `_id` for any element
+    /// that lacks one.
+    pub async fn insertManyDocs(self, collection: string, docsEnvelope: string): ExecResult {
+        return await self.docExec(codec.buildDocInsertManyFrame(collection, docsEnvelope));
+    }
+    /// Create a secondary index on `path` (a plain or dotted field path).
+    pub async fn createIndex(self, collection: string, path: string): ExecResult {
+        return await self.docExec(codec.buildDocCreateIndexFrame(collection, path));
+    }
+    /// Update every document matching the BSON `filter` with the update `spec`
+    /// (`$set`/`$unset`/`$inc`). Returns the count in the command tag.
+    pub async fn updateDocs(self, collection: string, filter: string, spec: string): ExecResult {
+        return await self.docExec(codec.buildDocUpdateFrame(collection, filter, spec));
+    }
+    /// Delete every document matching the BSON `filter`.
+    pub async fn deleteDocs(self, collection: string, filter: string): ExecResult {
+        return await self.docExec(codec.buildDocDeleteFrame(collection, filter));
+    }
+    /// Update matching documents, or insert one seeded from `filter` + `spec`
+    /// when none match (upsert).
+    pub async fn upsertDocs(self, collection: string, filter: string, spec: string): ExecResult {
+        return await self.docExec(codec.buildDocUpsertFrame(collection, filter, spec));
+    }
+    /// Apply a mixed batch of writes in one request. `opsEnvelope` is a BSON
+    /// document with an `ops` array: `{op:"insert",doc}`, `{op:"update",filter,
+    /// update}`, `{op:"upsert",filter,update}`, or `{op:"delete",filter}`.
+    pub async fn bulkWrite(self, collection: string, opsEnvelope: string): ExecResult {
+        return await self.docExec(codec.buildDocBulkWriteFrame(collection, opsEnvelope));
     }
     /// Return every document in `collection` matching the BSON `filter` (`{}` = all).
     pub async fn findDocs(self, collection: string, filter: string): DocResult {
@@ -223,6 +254,30 @@ pub struct NovaConnection impl Connection {
     /// Return the first document matching the BSON `filter` (zero or one document).
     pub async fn findOneDoc(self, collection: string, filter: string): DocResult {
         return await self.docQuery(codec.buildDocFindOneFrame(collection, filter));
+    }
+    /// Find with result shaping. `envelope` is a BSON document with optional
+    /// `filter`, `projection`, `sort` sub-documents and `skip`/`limit` integers.
+    pub async fn findQueryDocs(self, collection: string, envelope: string): DocResult {
+        return await self.docQuery(codec.buildDocFindQueryFrame(collection, envelope));
+    }
+    /// Count documents matching the BSON `filter`. The result is a single BSON
+    /// document `{ n: <count> }`; the app parses `n` out of it.
+    pub async fn countDocs(self, collection: string, filter: string): DocResult {
+        return await self.docQuery(codec.buildDocCountFrame(collection, filter));
+    }
+    /// Run an aggregation pipeline over `collection`. `pipeline` is a BSON
+    /// document `{stages: [ ... ]}` where each stage is a one-key document
+    /// (`$match`/`$group`/`$sort`/`$skip`/`$limit`/`$project`/`$count`). Returns
+    /// the pipeline output documents.
+    pub async fn aggregateDocs(self, collection: string, pipeline: string): DocResult {
+        return await self.docQuery(codec.buildDocAggregateFrame(collection, pipeline));
+    }
+    /// Fetch one cursor page. `envelope` is a BSON document with an optional
+    /// `filter`, an optional `after` (a 12-byte `_id` to resume past), and an
+    /// optional `batch` size. The returned page carries the documents and the id
+    /// to resume after (empty when the collection is exhausted).
+    pub async fn findCursor(self, collection: string, envelope: string): DocCursorResult {
+        return await self.docCursorQuery(codec.buildDocFindCursorFrame(collection, envelope));
     }
 
     // Send a write-style doc frame (create/insert) and drain to ReadyForQuery,
@@ -269,6 +324,43 @@ pub struct NovaConnection impl Connection {
         self.busy = false;
         return DocResult(docs, err);
     }
+
+    // Send a cursor find frame and collect the cursor page ('j' with a next id).
+    async fn docCursorQuery(self, frame: string): DocCursorResult {
+        if (self.busy) { return DocCursorResult(List<string>(), "", db.DbError("", "connection busy: concurrent use")); }
+        self.busy = true;
+        let sn = await proto.sendFrame(self.io, frame);
+        if (sn < 0) { self.busy = false; return DocCursorResult(List<string>(), "", connLost()); }
+        let docs = List<string>();
+        let next = "";
+        let err = noError();
+        while (true) {
+            let f = await proto.readFrame(self.reader);
+            if (f.ftype == -1) { if (err.isEmpty()) { err = connLost(); } break; }
+            if (f.ftype == 90) { break; }                                // 'Z' ReadyForQuery
+            if (f.ftype == 106) {                                        // 'j' cursor page
+                let page = codec.decodeDocCursorResult(f.payload);
+                let i = 0;
+                while (i < page.docs.size()) { docs.push(page.docs.get(i) ?? ""); i = i + 1; }
+                next = page.next;
+            }
+            if (f.ftype == 69) { err = codec.decodeError(f.payload); }   // 'E' ErrorResponse
+        }
+        self.busy = false;
+        return DocCursorResult(docs, next, err);
+    }
+}
+
+/// A cursor page result: the matched BSON documents, the id to resume after
+/// (empty string when the collection is exhausted), and any server error.
+pub struct DocCursorResult {
+    pub docs: List<string>,
+    pub next: string,
+    pub err: DbError,
+    init(docs: List<string>, next: string, err: DbError) { self.docs = docs; self.next = next; self.err = err; }
+    pub fn hasError(self): bool { return !self.err.isEmpty(); }
+    pub fn size(self): int { return self.docs.size(); }
+    pub fn exhausted(self): bool { return self.next == ""; }
 }
 
 /// A document query result: the matched BSON documents (each a raw byte-string) plus
