@@ -1,7 +1,7 @@
 // codec — the NovaDB binary wire CODEC (SRP: bytes <-> messages). Frame BUILDERS
 // (Startup/Query/Terminate/Password + extended-query Parse/Bind/Execute/Sync) and response
 // DECODERS (RowDescription, DataRow, CommandComplete, Authentication, ErrorResponse). Pure
-// over byte-buffer strings — the offline gate calls these directly; the connection (novadb.nova)
+// over byte-buffer strings — the offline gate calls these directly; the connection (novadb.ky)
 // wires them to a live stream via proto. Type interpretation is delegated to typemap.
 //
 // Framing: [type:u8][len:u32 BE][payload], len includes its own 4 bytes (pg convention).
@@ -11,7 +11,7 @@ import bytes;
 import db;
 import typemap;
 
-// --- BtFrame writers — build framed messages as binary-safe Nova strings --------
+// --- BtFrame writers — build framed messages as binary-safe Kyte strings --------
 fn byte1(b: int): string {
     let p = bytes.alloc(1);
     bytes.write_byte(p, 0, b);
@@ -36,7 +36,7 @@ fn frameOf(t: int, payload: string): string { return byte1(t) + u32be(4 + payloa
 
 /// Build the frames (pub for offline encode gating).
 pub fn buildStartupFrame(user: string, dbname: string): string {
-    let sp = u16be(1) + u16be(0) + wstr16(user) + wstr16(dbname) + wstr16("nova-driver");
+    let sp = u16be(1) + u16be(0) + wstr16(user) + wstr16(dbname) + wstr16("kyte-driver");
     return frameOf(72, sp);   // 'H'
 }
 pub fn buildQueryFrame(sql: string): string { return frameOf(81, wstr16(sql)); } // 'Q'

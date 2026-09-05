@@ -1,4 +1,4 @@
-// The NovaDB driver's DOCUMENT-model wire codec (src/codec.nova) — gated OFFLINE
+// The NovaDB driver's DOCUMENT-model wire codec (src/codec.ky) — gated OFFLINE
 // against hand-built byte buffers matching the server's 'J' doc opcode
 // (btree proto/wire.zig `Frontend.doc_op` + `encodeDocResult`). Verifies the
 // request-frame encoding (insert/find/find_one/create_collection) and the

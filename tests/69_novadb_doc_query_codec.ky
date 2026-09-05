@@ -1,4 +1,4 @@
-// The NovaDB driver's document QUERY-surface wire codec (src/codec.nova, D-11):
+// The NovaDB driver's document QUERY-surface wire codec (src/codec.ky, D-11):
 // the extended document opcodes (find_query / count / insert_many / find_cursor /
 // create_index) and the cursor-result ('j' with a next id) decode. Gated OFFLINE
 // against hand-built byte buffers matching btree proto/wire.zig.

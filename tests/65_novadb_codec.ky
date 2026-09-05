@@ -1,4 +1,4 @@
-// The typed NovaDB driver's wire CODEC (data/btree/codec.nova) — gated OFFLINE against
+// The typed NovaDB driver's wire CODEC (data/btree/codec.ky) — gated OFFLINE against
 // hand-built byte buffers matching the binary protocol (btree proto/wire.zig), so the
 // encode/decode is verified without a live server. Covers: request-frame encoding, typed
 // RowDescription + DataRow decode (int/text/bool/NULL), CommandComplete + Error decode,
@@ -12,7 +12,7 @@ import codec;
 import typemap;
 
 // Local big-endian byte-string builders (mirror the server's encoding) to synthesize wire
-// payloads. A Nova string is a length-headed byte buffer, so `+` concatenation is binary-safe.
+// payloads. A Kyte string is a length-headed byte buffer, so `+` concatenation is binary-safe.
 fn u16b(v: int): string {
     let p = bytes.alloc(2);
     bytes.write_byte(p, 0, (v / 256) % 256);
@@ -230,9 +230,9 @@ fn test_password_and_auth_method(): void {
 
 @test
 fn test_startup_frame_carries_creds(): void {
-    // Startup 'H' (72): [u16 major][u16 minor][user][db]["nova-driver"]. Wires the DSN user/db.
+    // Startup 'H' (72): [u16 major][u16 minor][user][db]["kyte-driver"]. Wires the DSN user/db.
     let f = codec.buildStartupFrame("kamlesh", "shop");
     assert.equalInt(f[0], 72);          // 'H'
-    let expect = u16b(1) + u16b(0) + s16("kamlesh") + s16("shop") + s16("nova-driver");
+    let expect = u16b(1) + u16b(0) + s16("kamlesh") + s16("shop") + s16("kyte-driver");
     assert.equalStr(string.slice(f, 5, f.length), expect);
 }

@@ -1,5 +1,5 @@
-// Compile-and-shape check for the document seam in src/novadb.nova. Importing
-// `novadb` forces the whole NovaConnection (including the new createCollection/
+// Compile-and-shape check for the document seam in src/novadb.ky. Importing
+// `novadb` forces the whole KyteConnection (including the new createCollection/
 // insertDoc/findDocs/findOneDoc methods) to typecheck offline; the async request
 // methods themselves need a live server, so here we only exercise the DocResult
 // value type they return.

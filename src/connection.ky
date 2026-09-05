@@ -1,7 +1,7 @@
 // connection: NovaDB connection-string parsing (SRP: connection string only).
 // `novadb://user[:password]@host[:port]/... ?db=..&tls=..&tlsCAFile=..`  (host:port is the
 // minimal form; the query params + `user:pass@` userinfo supply the rest). Pure string work;
-// no I/O, no db seam. The seam (novadb.nova) turns a ConnectionOptions into a live connection.
+// no I/O, no db seam. The seam (novadb.ky) turns a ConnectionOptions into a live connection.
 import string;
 
 pub struct ConnectionOptions {
@@ -51,10 +51,10 @@ pub fn parse(connectionString: string): ConnectionOptions {
 
     // Credentials from the connection string. `user=`/`password=`/`db=` query params provide defaults; a
     // `user:pass@host:port` userinfo prefix (if present) overrides user/password. Real creds now
-    // flow into the startup + auth handshake instead of the previously hardcoded "admin"/"nova".
+    // flow into the startup + auth handshake instead of the previously hardcoded "admin"/"kyte".
     let user = queryParam(connectionString, "user", "admin");
     let password = queryParam(connectionString, "password", "");
-    let dbname = queryParam(connectionString, "db", "nova");
+    let dbname = queryParam(connectionString, "db", "kyte");
     let at = string.indexOf(base, "@");
     if (at != -1) {
         let userinfo = string.slice(base, 0, at);

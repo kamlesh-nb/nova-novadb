@@ -1,4 +1,4 @@
-// The NovaDB connection-string parser (connection.nova) — gated OFFLINE (pure string work, no
+// The NovaDB connection-string parser (connection.ky) — gated OFFLINE (pure string work, no
 // I/O). Proves the driver honours the advertised `novadb://` URL form AND the bare `host:port`
 // form identically, plus userinfo credentials, `?db=`/`?tls=` query params, a trailing `/path`,
 // and the default port. This is what lets `storeConnectionString`'s `novadb://…` DSN connect.
@@ -63,6 +63,6 @@ fn defaults(): void {
     assert.equalStr(o.host, "localhost");
     assert.equalInt(o.port, 3009);
     assert.equalStr(o.user, "admin");
-    assert.equalStr(o.dbname, "nova");
+    assert.equalStr(o.dbname, "kyte");
     assert.isTrue(!o.useTls);
 }
